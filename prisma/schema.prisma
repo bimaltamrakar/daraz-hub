@@ -1,0 +1,104 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  admin
+  user
+}
+
+enum StoreStatus {
+  pending
+  connected
+  expiring_soon
+  expired
+  error
+}
+
+model User {
+  id                  String       @id @default(cuid())
+  name                String
+  email               String       @unique
+  passwordHash        String
+  role                Role         @default(user)
+  isActive            Boolean      @default(true)
+  mustChangePassword  Boolean      @default(false)
+  createdAt           DateTime     @default(now())
+  stores              Store[]
+  sessions            Session[]
+  oauthStates         OAuthState[]
+  auditLogs           AuditLog[]
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model Store {
+  id          String       @id @default(cuid())
+  userId      String
+  label       String
+  country     String
+  sellerId    String?
+  status      StoreStatus  @default(pending)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokens      StoreToken?
+  oauthStates OAuthState[]
+  auditLogs   AuditLog[]
+
+  @@index([userId])
+}
+
+model StoreToken {
+  storeId                String   @id
+  accessTokenEnc         String
+  refreshTokenEnc        String
+  accessExpiresAt        DateTime
+  refreshExpiresAt       DateTime
+  lastRefreshedAt        DateTime?
+  lastError              String?
+  updatedAt              DateTime @updatedAt
+  store                  Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+}
+
+model OAuthState {
+  state      String   @id
+  userId     String
+  storeId    String
+  expiresAt  DateTime
+  used       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  store      Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  storeId   String?
+  action    String
+  meta      Json?
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  store     Store?   @relation(fields: [storeId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId])
+}
