@@ -46,7 +46,8 @@ export default function App() {
   }, []);
   useEffect(() => {
     const params = new URLSearchParams(location.search);
-    if (params.has("error")) setNotice("Daraz connection needs app credentials and verified API configuration.");
+    if (params.get("error") === "daraz_connection_failed") setNotice("Daraz authorization completed, but token exchange failed. Check the server logs and Daraz app configuration.");
+    else if (params.has("error")) setNotice("Daraz authorization was not completed.");
     else if (params.has("connected")) setNotice("Store connected.");
   }, []);
   useEffect(() => {

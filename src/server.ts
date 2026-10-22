@@ -10,9 +10,9 @@ import { z } from "zod";
 import { db } from "./lib/db";
 import { config } from "./lib/config";
 import { audit } from "./lib/audit";
-import { sha256 } from "./lib/crypto";
+import { encrypt, sha256 } from "./lib/crypto";
 import { authenticate, activeUser, requireAdmin } from "./lib/auth";
-import { authorizationUrl, createOAuthState, exchangeAuthorizationCode, refreshDarazToken } from "./lib/daraz";
+import { authorizationUrl, createOAuthState, exchangeAuthorizationCode, refreshDarazToken, type DarazTokenResponse } from "./lib/daraz";
 import { isOAuthStateUsable, isRefreshTokenUsable, ownedStoreFilter } from "./lib/policies";
 
 const app = express();
@@ -60,6 +60,27 @@ function displayStoreStatus(store: { status: string; tokens?: { accessExpiresAt:
   if (store.status === "error") return "error";
   if (store.tokens.refreshExpiresAt.getTime() <= now + 7 * 86400000) return "expiring_soon";
   return "connected";
+}
+async function saveDarazTokens(storeId: string, tokens: DarazTokenResponse, refreshed: boolean) {
+  const tokenData = {
+    accessTokenEnc: encrypt(tokens.accessToken),
+    refreshTokenEnc: encrypt(tokens.refreshToken),
+    accessExpiresAt: tokens.accessExpiresAt,
+    refreshExpiresAt: tokens.refreshExpiresAt,
+    lastRefreshedAt: refreshed ? new Date() : null,
+    lastError: null,
+  };
+  await db.$transaction([
+    db.storeToken.upsert({
+      where: { storeId },
+      create: { storeId, ...tokenData },
+      update: tokenData,
+    }),
+    db.store.update({
+      where: { id: storeId },
+      data: { status: "connected", ...(tokens.sellerId ? { sellerId: tokens.sellerId } : {}) },
+    }),
+  ]);
 }
 const passwordSchema = z.string().min(12).max(128).regex(/[a-z]/).regex(/[A-Z]/).regex(/[0-9]/).regex(/[^A-Za-z0-9]/);
 const authRouter = express.Router();
@@ -135,13 +156,17 @@ app.get("/api/oauth/daraz/callback", async (req, res) => {
   }
   if (!parsed.data.code) return res.status(400).send("OAuth callback did not include an authorization code.");
   try {
-    await exchangeAuthorizationCode(saved.store.country, parsed.data.code);
+    const tokens = await exchangeAuthorizationCode(saved.store.country, parsed.data.code);
+    await saveDarazTokens(saved.storeId, tokens, false);
     await audit("store_connected", saved.userId, saved.storeId);
     return res.redirect(`${config.APP_ORIGIN}/stores?connected=true`);
-  } catch {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown Daraz token exchange error.";
+    console.error("Daraz token exchange failed:", message.slice(0, 500));
     await db.store.update({ where: { id: saved.storeId }, data: { status: "error" } });
+    await db.storeToken.updateMany({ where: { storeId: saved.storeId }, data: { lastError: message.slice(0, 500) } });
     await audit("store_connection_failed", saved.userId, saved.storeId);
-    return res.redirect(`${config.APP_ORIGIN}/stores?error=daraz_setup_required`);
+    return res.redirect(`${config.APP_ORIGIN}/stores?error=daraz_connection_failed`);
   }
 });
 
@@ -203,8 +228,8 @@ api.post("/stores/:id/refresh", rateLimit(10, 60000), async (req, res) => {
   try {
     const currentRefresh = (await import("./lib/crypto")).decrypt(store.tokens.refreshTokenEnc);
     const token = await refreshDarazToken(store.country, currentRefresh);
-    void token;
-    return res.json({ status: store.status, accessExpiresAt: store.tokens.accessExpiresAt, refreshExpiresAt: store.tokens.refreshExpiresAt });
+    await saveDarazTokens(store.id, token, true);
+    return res.json({ status: "connected", accessExpiresAt: token.accessExpiresAt, refreshExpiresAt: token.refreshExpiresAt });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Daraz token refresh failed.";
     await db.store.update({ where: { id: store.id }, data: { status: "error" } });

@@ -20,12 +20,17 @@ const schema = z.object({
 
 export const config = schema.parse(process.env);
 const darazRegionsJson = config.DARAZ_REGIONS_JSON.trim();
-export const darazRegions = z.record(z.string(), z.object({
+const darazRegionSchema = z.object({
   authorizeUrl: z.string().url(),
-  tokenUrl: z.string().url(),
-  refreshUrl: z.string().url(),
+  apiBaseUrl: z.string().url().optional(),
+  tokenUrl: z.string().url().optional(),
+  refreshUrl: z.string().url().optional(),
   appKey: z.string().min(1),
   appSecret: z.string().min(1),
   redirectUri: z.string().url(),
-  signingMode: z.string().min(1),
-})).parse(darazRegionsJson ? JSON.parse(darazRegionsJson) : {});
+  signingMode: z.string().optional(),
+}).refine((region) => Boolean(region.apiBaseUrl || region.tokenUrl), {
+  message: "Each Daraz region must set apiBaseUrl.",
+});
+
+export const darazRegions = z.record(z.string(), darazRegionSchema).parse(darazRegionsJson ? JSON.parse(darazRegionsJson) : {});

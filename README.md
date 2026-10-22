@@ -35,25 +35,23 @@ Register an application in the [Daraz Open Platform console](https://open.daraz.
 
 `https://YOUR_PUBLIC_HOST/api/oauth/daraz/callback`
 
-Set `DARAZ_REGIONS_JSON` to a JSON object keyed by two-letter marketplace code (for example `NP`). Each entry requires:
+Set `DARAZ_REGIONS_JSON` to a one-line JSON object keyed by two-letter marketplace code (for example `NP`). Each entry requires:
 
 ```json
 {
   "NP": {
     "authorizeUrl": "SET_FROM_DARAZ_DOCUMENTATION",
-    "tokenUrl": "SET_FROM_DARAZ_DOCUMENTATION",
-    "refreshUrl": "SET_FROM_DARAZ_DOCUMENTATION",
+    "apiBaseUrl": "https://api.daraz.com/rest",
     "appKey": "SET_FROM_DARAZ_CONSOLE",
     "appSecret": "SET_FROM_DARAZ_CONSOLE",
-    "redirectUri": "https://YOUR_PUBLIC_HOST/api/oauth/daraz/callback",
-    "signingMode": "disabled-until-verified"
+    "redirectUri": "https://YOUR_PUBLIC_HOST/api/oauth/daraz/callback"
   }
 }
 ```
 
-**Important integration status:** The public documentation entry point currently renders its guides dynamically. The documentation available without app-specific access confirms HMAC is used for API signatures, but did not expose the OAuth authorize/token paths, required token request parameters, response field/expiry semantics, or exact signature canonicalization. This project deliberately does not guess these values. Authorization redirect construction uses the requested `client_id`, `redirect_uri`, `response_type=code`, and state parameters; token exchange and refresh fail closed until a Daraz-specific signing adapter is implemented from the docs for your app/market. As a result, store management and account flows work, but OAuth connection/token refresh are not operational yet. Do not set `signingMode` to claim otherwise. Provide the exact official token create/refresh specification (including canonical signing string and parameter placement) to finish that adapter.
+The seller authorization flow returns an authorization code to the registered callback. The API exchanges it using `/auth/token/create` and refreshes using `/auth/token/refresh` against `apiBaseUrl`. Requests use Lazop signing: sort request parameters by key, concatenate each key and value after the API path, then HMAC-SHA256 with the app secret and uppercase the hexadecimal signature. Token values are encrypted at rest; replace stored tokens with the newest access and refresh tokens returned by create or refresh. The authorization code expires after 30 minutes. Refer to Daraz's [Seller Authorization Introduction](https://open.daraz.com/doc/doc.htm?#/?docId=490) for the documented flow and response fields.
 
-The Daraz `appSecret` is accepted only from environment configuration and must never be committed. Use the correct per-market values and callback configuration from the application console.
+For backward compatibility, an existing `tokenUrl` field can remain in the region configuration; when `apiBaseUrl` is absent the app uses Daraz's documented `https://api.daraz.com/rest` service address. `refreshUrl` and `signingMode` are no longer needed. The Daraz `appSecret` is accepted only from environment configuration and must never be committed. Use the correct per-market values and callback configuration from the application console.
 
 ## Production deployment
 
