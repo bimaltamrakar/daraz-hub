@@ -40,8 +40,8 @@ Set `DARAZ_REGIONS_JSON` to a one-line JSON object keyed by two-letter marketpla
 ```json
 {
   "NP": {
-    "authorizeUrl": "SET_FROM_DARAZ_DOCUMENTATION",
-    "apiBaseUrl": "https://api.daraz.com/rest",
+    "authorizeUrl": "https://api.daraz.com.np/oauth/authorize",
+    "apiBaseUrl": "https://api.daraz.com.np/rest",
     "appKey": "SET_FROM_DARAZ_CONSOLE",
     "appSecret": "SET_FROM_DARAZ_CONSOLE",
     "redirectUri": "https://YOUR_PUBLIC_HOST/api/oauth/daraz/callback"
@@ -51,7 +51,13 @@ Set `DARAZ_REGIONS_JSON` to a one-line JSON object keyed by two-letter marketpla
 
 The seller authorization flow returns an authorization code to the registered callback. The API exchanges it using `/auth/token/create` and refreshes using `/auth/token/refresh` against `apiBaseUrl`. Requests use Lazop signing: sort request parameters by key, concatenate each key and value after the API path, then HMAC-SHA256 with the app secret and uppercase the hexadecimal signature. Token values are encrypted at rest; replace stored tokens with the newest access and refresh tokens returned by create or refresh. The authorization code expires after 30 minutes. Refer to Daraz's [Seller Authorization Introduction](https://open.daraz.com/doc/doc.htm?#/?docId=490) for the documented flow and response fields.
 
-For backward compatibility, an existing `tokenUrl` field can remain in the region configuration; when `apiBaseUrl` is absent the app uses Daraz's documented `https://api.daraz.com/rest` service address. `refreshUrl` and `signingMode` are no longer needed. The Daraz `appSecret` is accepted only from environment configuration and must never be committed. Use the correct per-market values and callback configuration from the application console.
+Daraz serves both the authorization page and the REST gateway per marketplace: `api.daraz.pk`, `api.daraz.com.bd`, `api.daraz.lk`, `api.daraz.com.np` and `api.shop.com.mm` (`/oauth/authorize` and `/rest` respectively). The generic `api.daraz.com` host shown in some older documentation does not resolve in DNS, so token exchange against it fails with `ENOTFOUND`. `apiBaseUrl` is optional: when it is absent the app derives the gateway from the `authorizeUrl` host. For backward compatibility an existing `tokenUrl` field can remain in the region configuration; `refreshUrl` and `signingMode` are ignored. The Daraz `appSecret` is accepted only from environment configuration and must never be committed.
+
+### What is saved at authorization
+
+When the seller completes authorization the app exchanges the code, encrypts the tokens, and records the seller identity returned with the token (`account`, `account_platform`, `country`, and the matching `country_user_info` entry's `seller_id`, `user_id` and `short_code`). It then calls `GET /seller/get` with the fresh access token and stores the seller profile (name, company, email, short code, status, verification, location, plus the raw payload). A profile failure never blocks the connection: the reason is saved on the store, logged as `store_profile_fetch_failed`, and can be retried from the store details page with "Refresh details". Click any store name in the hub to open its details, connection history and recent activity.
+
+The OAuth `state` is single-use, expires after `OAUTH_STATE_TTL_MINUTES`, and is bound to the browser that started the connection through a short-lived `daraz_oauth_state` cookie (HttpOnly, SameSite=Lax, path `/api/oauth/daraz`). In production a callback whose state does not match the cookie is rejected, which stops a third party from handing a seller a link that connects their account to someone else's store. Outside production the mismatch is only logged, because the Vite dev server and a public callback tunnel usually run on different hosts.
 
 ## Production deployment
 
@@ -61,8 +67,8 @@ Set strong unique secrets and `COOKIE_SECURE=true`, ensure the Supabase project 
 
 - OpenAPI documentation: `openapi.yaml`; endpoint index is also available at `GET /api/openapi.json`.
 - Authentication: `POST /api/auth/signup`, `/login`, `/refresh`, `/logout`, `/password`.
-- Stores: `GET/POST /api/stores`, `DELETE /api/stores/:id`, `POST /api/stores/:id/connect`, `/refresh`.
-- Dashboard: `GET /api/dashboard`. Admin: `GET /api/admin/users`, `/stores`, `/audit`; `PATCH /api/admin/users/:id`.
+- Stores: `GET/POST /api/stores`, `GET/DELETE /api/stores/:id`, `POST /api/stores/:id/connect`, `/refresh`, `/profile`.
+- Dashboard: `GET /api/dashboard`. Admin: `GET /api/admin/users`, `/stores`, `/stores/:id`, `/audit`; `PATCH /api/admin/users/:id`.
 - Run `npm test` for security and signing-helper unit tests; `npm run build` for type-check and production build.
 
 The refresh/session cookie is HttpOnly, SameSite=Strict and Secure when configured. Store tokens are encrypted with AES-256-GCM and never returned. Daraz token exchange and refresh failures record a sanitized phase and reason in the admin activity log; credentials, tokens, and OAuth callback codes are redacted.

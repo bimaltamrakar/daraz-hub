@@ -1,8 +1,20 @@
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 
 type User = { id: string; name: string; email: string; role: "admin" | "user"; mustChangePassword: boolean };
-type Store = { id: string; label: string; country: string; status: string; sellerId: string | null; accessExpiresAt: string | null; refreshExpiresAt: string | null; lastError: string | null };
+type Store = {
+  id: string; label: string; country: string; status: string; createdAt: string;
+  sellerId: string | null; sellerName: string | null; companyName: string | null; sellerEmail: string | null; shortCode: string | null;
+  account: string | null; accountPlatform: string | null; darazCountry: string | null; darazUserId: string | null;
+  sellerStatus: string | null; verified: boolean | null; location: string | null; connectedAt: string | null;
+  profile: Record<string, unknown> | null; profileFetchedAt: string | null; profileError: string | null;
+  accessExpiresAt: string | null; refreshExpiresAt: string | null; lastRefreshedAt: string | null; lastError: string | null;
+  user?: { name: string; email: string };
+};
+type Activity = { id: string; action: string; createdAt: string; meta?: { phase?: string; reason?: string } | null };
+type StoreDetails = Store & { activity: Activity[] };
 type Summary = { total: number; connected: number; expiringSoon: number; expired: number };
+type Route = { page: "dashboard" | "stores" | "store" | "admin" | "admin-store" | "audit"; storeId?: string };
+
 const api = async (path: string, token?: string, init: RequestInit = {}) => {
   const response = await fetch(`/api${path}`, {
     ...init, credentials: "include",
@@ -15,15 +27,38 @@ const api = async (path: string, token?: string, init: RequestInit = {}) => {
 };
 const dateLabel = (date: string | null) => date ? new Date(date).toLocaleString() : "Not connected";
 const daysUntil = (date: string | null) => date ? Math.ceil((new Date(date).getTime() - Date.now()) / 86400000) : null;
+const connectLabel = (store: Store) => store.status === "pending" || store.status === "error" ? "Connect store" : "Reconnect";
+
+function routeFor(pathname: string): Route {
+  const adminStore = pathname.match(/^\/admin\/stores\/([^/]+)/);
+  if (adminStore) return { page: "admin-store", storeId: adminStore[1] };
+  if (pathname.startsWith("/admin")) return { page: "admin" };
+  if (pathname.startsWith("/audit")) return { page: "audit" };
+  const store = pathname.match(/^\/stores\/([^/]+)/);
+  if (store) return { page: "store", storeId: store[1] };
+  if (pathname.startsWith("/stores")) return { page: "stores" };
+  return { page: "dashboard" };
+}
+const pathFor = (route: Route) =>
+  route.page === "store" ? `/stores/${route.storeId}` : route.page === "admin-store" ? `/admin/stores/${route.storeId}` : route.page === "dashboard" ? "/" : `/${route.page}`;
+const titleFor = (route: Route) =>
+  ({ dashboard: "Overview", stores: "My stores", store: "Store details", admin: "Administration", "admin-store": "Store details", audit: "Audit log" })[route.page];
 
 export default function App() {
   const [token, setToken] = useState("");
   const [user, setUser] = useState<User | null>(null);
-  const [page, setPage] = useState(location.pathname === "/admin" ? "admin" : "dashboard");
+  const [route, setRoute] = useState<Route>(() => routeFor(location.pathname));
   const [stores, setStores] = useState<Store[]>([]);
   const [summary, setSummary] = useState<Summary>({ total: 0, connected: 0, expiringSoon: 0, expired: 0 });
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const page = route.page;
+
+  const navigate = useCallback((next: Route) => {
+    setRoute(next);
+    if (location.pathname !== pathFor(next)) history.pushState(null, "", pathFor(next));
+  }, []);
+  const openStore = (store: { id: string }) => navigate({ page: "store", storeId: store.id });
 
   const load = useCallback(async (access = token) => {
     if (!access) return;
@@ -46,9 +81,14 @@ export default function App() {
   }, []);
   useEffect(() => {
     const params = new URLSearchParams(location.search);
-    if (params.get("error") === "daraz_connection_failed") setNotice("Daraz authorization completed, but token exchange failed. Check the server logs and Daraz app configuration.");
+    if (params.get("error") === "daraz_connection_failed") setNotice("Daraz authorization completed, but token exchange failed. See the store's last error below and check the server logs.");
     else if (params.has("error")) setNotice("Daraz authorization was not completed.");
-    else if (params.has("connected")) setNotice("Store connected.");
+    else if (params.get("connected") === "partial") setNotice("Store connected, but Daraz did not return the seller profile. See the store details for the reason and try \"Refresh details\".");
+    else if (params.has("connected")) setNotice("Store connected and seller details saved.");
+    if (params.has("error") || params.has("connected")) history.replaceState(null, "", location.pathname);
+    const onPop = () => setRoute(routeFor(location.pathname));
+    addEventListener("popstate", onPop);
+    return () => removeEventListener("popstate", onPop);
   }, []);
   useEffect(() => {
     if (user) load();
@@ -59,7 +99,7 @@ export default function App() {
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
       const result = await api(`/auth/${mode}`, undefined, { method: "POST", body: JSON.stringify(data) });
-      setToken(result.accessToken); setUser(result.user); setPage("dashboard");
+      setToken(result.accessToken); setUser(result.user);
       await load(result.accessToken);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to sign in."); }
     finally { setBusy(false); }
@@ -91,9 +131,9 @@ export default function App() {
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to refresh token."); }
   }
   async function remove(store: Store) {
-    if (!confirm(`Remove ${store.label} and its saved tokens?`)) return;
-    try { await api(`/stores/${store.id}`, token, { method: "DELETE" }); await load(); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Unable to remove store."); }
+    if (!confirm(`Remove ${store.label} and its saved tokens?`)) return false;
+    try { await api(`/stores/${store.id}`, token, { method: "DELETE" }); await load(); return true; }
+    catch (error) { setNotice(error instanceof Error ? error.message : "Unable to remove store."); return false; }
   }
   async function changePassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -121,59 +161,114 @@ export default function App() {
     </section>
   </main>;
 
+  const isAdminPage = page === "admin" || page === "admin-store";
   return <div className="app-shell">
-    <aside className="sidebar"><a className="logo" href="/" onClick={(e) => { e.preventDefault(); setPage("dashboard"); }}><span className="brand-mark small">D</span><span>Daraz<span className="muted"> Hub</span></span></a>
+    <aside className="sidebar"><a className="logo" href="/" onClick={(e) => { e.preventDefault(); navigate({ page: "dashboard" }); }}><span className="brand-mark small">D</span><span>Daraz<span className="muted"> Hub</span></span></a>
       <div className="nav-caption">WORKSPACE</div>
-      <button className={page === "dashboard" ? "nav active" : "nav"} onClick={() => setPage("dashboard")}>◫ &nbsp;Overview</button>
-      <button className={page === "stores" ? "nav active" : "nav"} onClick={() => setPage("stores")}>▤ &nbsp;My stores</button>
-      {user.role === "admin" && <><div className="nav-caption">ADMINISTRATION</div><button className={page === "admin" ? "nav active" : "nav"} onClick={() => setPage("admin")}>♙ &nbsp;Users & stores</button><button className={page === "audit" ? "nav active" : "nav"} onClick={() => setPage("audit")}>◷ &nbsp;Audit log</button></>}
+      <button className={page === "dashboard" ? "nav active" : "nav"} onClick={() => navigate({ page: "dashboard" })}>◫ &nbsp;Overview</button>
+      <button className={page === "stores" || page === "store" ? "nav active" : "nav"} onClick={() => navigate({ page: "stores" })}>▤ &nbsp;My stores</button>
+      {user.role === "admin" && <><div className="nav-caption">ADMINISTRATION</div><button className={isAdminPage ? "nav active" : "nav"} onClick={() => navigate({ page: "admin" })}>♙ &nbsp;Users & stores</button><button className={page === "audit" ? "nav active" : "nav"} onClick={() => navigate({ page: "audit" })}>◷ &nbsp;Audit log</button></>}
       <div className="profile"><span className="avatar">{user.name[0]?.toUpperCase()}</span><div className="profile-text"><strong>{user.name}</strong><small>{user.email}</small></div><button className="icon-button" aria-label="Sign out" onClick={logout}>↗</button></div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><p className="eyebrow">YOUR WORKSPACE</p><h1>{page === "dashboard" ? "Overview" : page === "stores" ? "My stores" : page === "audit" ? "Audit log" : "Administration"}</h1></div><span className="secure"><span className="dot" /> Secure workspace</span></header>
+      <header className="topbar"><div><p className="eyebrow">YOUR WORKSPACE</p><h1>{titleFor(route)}</h1></div><span className="secure"><span className="dot" /> Secure workspace</span></header>
       {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
       {user.mustChangePassword ? <section className="panel narrow"><h2>Set a new password</h2><p className="muted">The seeded administrator password must be changed before using this account.</p><form className="form-stack" onSubmit={changePassword}><label>Current password<input required name="currentPassword" type="password" /></label><label>New password<input required name="newPassword" type="password" minLength={12} /></label><button>Update password</button></form></section> :
       page === "dashboard" ? <>
         <div className="stat-grid">{[["Total stores", summary.total, "stores connected or pending"], ["Connected", summary.connected, "ready to use"], ["Expiring soon", summary.expiringSoon, "refresh token expires in 7 days"], ["Expired", summary.expired, "reconnect required"]].map(([title, value, sub], i) => <article className="stat-card" key={title}><div className="stat-head"><span>{title}</span><span className={`stat-icon icon-${i}`}>{["▤", "✓", "◷", "!"][i]}</span></div><strong>{value}</strong><small>{sub}</small></article>)}</div>
-        <section className="panel"><div className="section-head"><div><h2>Store connections</h2><p className="muted">A quick look at your Daraz seller accounts.</p></div><button className="secondary" onClick={() => setPage("stores")}>Manage stores <span>→</span></button></div>
-          {stores.length ? <StoreList stores={stores.slice(0, 3)} onConnect={connect} onRefresh={refresh} onRemove={remove} /> : <EmptyStores onClick={() => setPage("stores")} />}
+        <section className="panel"><div className="section-head"><div><h2>Store connections</h2><p className="muted">A quick look at your Daraz seller accounts.</p></div><button className="secondary" onClick={() => navigate({ page: "stores" })}>Manage stores <span>→</span></button></div>
+          {stores.length ? <StoreList stores={stores.slice(0, 3)} onOpen={openStore} onConnect={connect} onRefresh={refresh} onRemove={remove} /> : <EmptyStores onClick={() => navigate({ page: "stores" })} />}
         </section>
       </> : page === "stores" ? <>
         <section className="panel add-panel"><div><h2>Add a store</h2><p className="muted">Start with a label and your Daraz marketplace region.</p></div><form className="add-form" onSubmit={addStore}><label>Store label<input required name="label" placeholder="e.g. Kathmandu Outlet" maxLength={100} /></label><label>Country / region<select required name="country" defaultValue=""><option value="" disabled>Select region</option><option value="NP">Nepal (NP)</option><option value="PK">Pakistan (PK)</option><option value="BD">Bangladesh (BD)</option><option value="LK">Sri Lanka (LK)</option><option value="MM">Myanmar (MM)</option></select></label><button disabled={busy}>Add store</button></form></section>
-        <section className="panel"><div className="section-head"><div><h2>Your stores <span className="count">{stores.length}</span></h2><p className="muted">Connect and keep each seller token up to date.</p></div></div>{stores.length ? <StoreList stores={stores} onConnect={connect} onRefresh={refresh} onRemove={remove} /> : <EmptyStores onClick={() => document.querySelector<HTMLInputElement>('input[name="label"]')?.focus()} />}</section>
-      </> : page === "admin" ? <Admin token={token} /> : <Audit token={token} />}
+        <section className="panel"><div className="section-head"><div><h2>Your stores <span className="count">{stores.length}</span></h2><p className="muted">Click a store name for its seller details and connection history.</p></div></div>{stores.length ? <StoreList stores={stores} onOpen={openStore} onConnect={connect} onRefresh={refresh} onRemove={remove} /> : <EmptyStores onClick={() => document.querySelector<HTMLInputElement>('input[name="label"]')?.focus()} />}</section>
+      </> : page === "store" ? <StoreDetail key={route.storeId} token={token} storeId={route.storeId!} onBack={() => navigate({ page: "stores" })} onConnect={connect} onRefresh={refresh} onRemove={async (store) => { if (await remove(store)) navigate({ page: "stores" }); }} onNotice={setNotice} />
+      : page === "admin-store" ? <StoreDetail key={route.storeId} token={token} storeId={route.storeId!} admin onBack={() => navigate({ page: "admin" })} onNotice={setNotice} />
+      : page === "admin" ? <Admin token={token} onOpenStore={(store) => navigate({ page: "admin-store", storeId: store.id })} /> : <Audit token={token} />}
       <footer>Daraz Store Hub <span>Tokens are encrypted at rest and never shown in the browser.</span></footer>
     </main>
   </div>;
 }
 
 function EmptyStores({ onClick }: { onClick: () => void }) { return <div className="empty"><span>▤</span><strong>No stores yet</strong><p>Add a Daraz seller store to see its connection and token health here.</p><button className="secondary" onClick={onClick}>Add your first store</button></div>; }
-function StoreList({ stores, onConnect, onRefresh, onRemove }: { stores: Store[]; onConnect: (store: Store) => void; onRefresh: (store: Store) => void; onRemove: (store: Store) => void }) {
+function StoreList({ stores, onOpen, onConnect, onRefresh, onRemove }: { stores: Store[]; onOpen: (store: Store) => void; onConnect: (store: Store) => void; onRefresh: (store: Store) => void; onRemove: (store: Store) => void }) {
   return <div className="store-list">{stores.map((store) => {
     const refreshDays = daysUntil(store.refreshExpiresAt);
-    return <article className="store-row" key={store.id}><div className="store-avatar">▤</div><div className="store-info"><div className="store-title"><strong>{store.label}</strong><span className={`badge ${store.status}`}>{store.status.replace("_", " ")}</span></div><span className="muted">{store.country} marketplace{store.sellerId ? ` · Seller ${store.sellerId}` : ""}</span><small>Access expires: {dateLabel(store.accessExpiresAt)}</small>{refreshDays !== null && refreshDays <= 7 && <small className="warning">Refresh token expires in {Math.max(refreshDays, 0)} days — reconnect soon.</small>}{store.lastError && <small className="warning">{store.lastError}</small>}</div><div className="store-actions"><button className="secondary" onClick={() => onConnect(store)}>{store.status === "pending" || store.status === "error" ? "Connect store" : "Reconnect"}</button><button className="text-button" disabled={!store.refreshExpiresAt || refreshDays !== null && refreshDays <= 0} onClick={() => onRefresh(store)}>Get new access token</button><button className="remove-button" onClick={() => onRemove(store)}>Remove</button></div></article>;
+    return <article className="store-row" key={store.id}><div className="store-avatar">▤</div><div className="store-info"><div className="store-title"><button className="link-button" onClick={() => onOpen(store)} aria-label={`View details for ${store.label}`}>{store.label}</button><span className={`badge ${store.status}`}>{store.status.replace("_", " ")}</span></div><span className="muted">{store.country} marketplace{store.sellerName ? ` · ${store.sellerName}` : ""}{store.sellerId ? ` · Seller ${store.sellerId}` : ""}</span><small>Access expires: {dateLabel(store.accessExpiresAt)}</small>{refreshDays !== null && refreshDays <= 7 && <small className="warning">Refresh token expires in {Math.max(refreshDays, 0)} days — reconnect soon.</small>}{store.lastError && <small className="warning">{store.lastError}</small>}</div><div className="store-actions"><button className="secondary" onClick={() => onConnect(store)}>{connectLabel(store)}</button><button className="text-button" disabled={!store.refreshExpiresAt || refreshDays !== null && refreshDays <= 0} onClick={() => onRefresh(store)}>Get new access token</button><button className="remove-button" onClick={() => onRemove(store)}>Remove</button></div></article>;
   })}</div>;
 }
 
-function Admin({ token }: { token: string }) {
+function Details({ rows }: { rows: Array<[string, ReactNode, string?]> }) {
+  return <dl className="detail-grid">{rows.map(([term, value, className]) => <div key={term}><dt>{term}</dt><dd className={className}>{value === null || value === undefined || value === "" ? "—" : value}</dd></div>)}</dl>;
+}
+function StoreDetail({ token, storeId, admin = false, onBack, onConnect, onRefresh, onRemove, onNotice }: {
+  token: string; storeId: string; admin?: boolean; onBack: () => void;
+  onConnect?: (store: Store) => void; onRefresh?: (store: Store) => Promise<void>; onRemove?: (store: Store) => Promise<void>; onNotice: (message: string) => void;
+}) {
+  const [store, setStore] = useState<StoreDetails | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const path = admin ? `/admin/stores/${storeId}` : `/stores/${storeId}`;
+  const reload = useCallback(() => api(path, token).then((data) => { setStore(data); setError(""); }).catch((e) => setError(e.message)), [path, token]);
+  useEffect(() => { reload(); }, [reload]);
+
+  async function refreshProfile() {
+    if (!store) return;
+    setBusy(true);
+    try { await api(`/stores/${store.id}/profile`, token, { method: "POST" }); await reload(); onNotice("Seller details updated from Daraz."); }
+    catch (e) { onNotice(e instanceof Error ? e.message : "Unable to refresh seller details."); }
+    finally { setBusy(false); }
+  }
+  async function refreshToken() {
+    if (!store || !onRefresh) return;
+    setBusy(true);
+    try { await onRefresh(store); await reload(); } finally { setBusy(false); }
+  }
+
+  const back = <button className="back-button" onClick={onBack}>← {admin ? "All stores" : "My stores"}</button>;
+  if (error) return <section className="panel">{back}<p className="notice error">{error}</p></section>;
+  if (!store) return <section className="panel">{back}<p className="muted">Loading store…</p></section>;
+  const refreshDays = daysUntil(store.refreshExpiresAt);
+  const accessValid = Boolean(store.accessExpiresAt) && new Date(store.accessExpiresAt!).getTime() > Date.now();
+  const hasIdentity = Boolean(store.sellerId || store.account || store.profileFetchedAt);
+  return <>
+    <section className="panel">{back}
+      <div className="detail-head"><div className="store-avatar">▤</div><div className="store-info"><div className="store-title"><h2>{store.label}</h2><span className={`badge ${store.status}`}>{store.status.replace("_", " ")}</span>{store.verified && <span className="badge connected">Verified</span>}</div><span className="muted">{store.country} marketplace{store.sellerName ? ` · ${store.sellerName}` : ""}{store.shortCode ? ` · ${store.shortCode}` : ""}</span>{admin && store.user && <small>Owner: {store.user.name} ({store.user.email})</small>}</div>
+        {!admin && <div className="store-actions"><button className="secondary" onClick={() => onConnect?.(store)}>{connectLabel(store)}</button><button className="text-button" disabled={busy || !store.refreshExpiresAt || refreshDays !== null && refreshDays <= 0} onClick={refreshToken}>Get new access token</button><button className="text-button" disabled={busy || !accessValid} title={accessValid ? "Fetch the latest seller profile from Daraz" : "Requires a valid access token"} onClick={refreshProfile}>Refresh details</button><button className="remove-button" onClick={() => onRemove?.(store)}>Remove</button></div>}
+      </div>
+    </section>
+    <section className="panel"><h2>Seller account</h2><p className="muted">{hasIdentity ? "Captured from Daraz when this store was authorized." : "Seller details are captured from Daraz when you connect the store."}</p>
+      <Details rows={[
+        ["Seller name", store.sellerName], ["Company", store.companyName], ["Seller ID", store.sellerId], ["Short code", store.shortCode],
+        ["Daraz account", store.account], ["Seller email", store.sellerEmail], ["Account platform", store.accountPlatform], ["Daraz user ID", store.darazUserId],
+        ["Marketplace", store.darazCountry ?? store.country], ["Location", store.location], ["Seller status", store.sellerStatus], ["Verified", store.verified === null ? null : store.verified ? "Yes" : "No"],
+        ["Details fetched", store.profileFetchedAt ? dateLabel(store.profileFetchedAt) : null], ...(store.profileError ? [["Profile error", store.profileError, "warning"] as [string, ReactNode, string]] : []),
+      ]} />
+    </section>
+    <section className="panel"><h2>Connection & tokens</h2><p className="muted">Token values are encrypted at rest and never shown here.</p>
+      <Details rows={[
+        ["Status", store.status.replace("_", " ")], ["First connected", store.connectedAt ? dateLabel(store.connectedAt) : null], ["Access token expires", dateLabel(store.accessExpiresAt)],
+        ["Refresh token expires", dateLabel(store.refreshExpiresAt)], ["Last token refresh", store.lastRefreshedAt ? dateLabel(store.lastRefreshedAt) : "Never"], ["Store added", dateLabel(store.createdAt)],
+        ...(store.lastError ? [["Last error", store.lastError, "warning"] as [string, ReactNode, string]] : []),
+      ]} />
+      {refreshDays !== null && refreshDays <= 7 && <p className="notice">Refresh token expires in {Math.max(refreshDays, 0)} days — reconnect soon.</p>}
+    </section>
+    <section className="panel"><h2>Recent activity</h2>{store.activity.length ? <div className="table-wrap"><table><thead><tr><th>Event</th><th>Details</th><th>Time</th></tr></thead><tbody>{store.activity.map((row) => <tr key={row.id}><td>{row.action.replaceAll("_", " ")}</td><td>{row.meta?.reason ? <><strong>{row.meta.phase?.replaceAll("_", " ") ?? "Details"}</strong><small>{row.meta.reason}</small></> : "—"}</td><td>{dateLabel(row.createdAt)}</td></tr>)}</tbody></table></div> : <p className="muted">No activity recorded yet.</p>}</section>
+  </>;
+}
+
+function Admin({ token, onOpenStore }: { token: string; onOpenStore: (store: Store) => void }) {
   const [users, setUsers] = useState<any[]>([]);
-  const [stores, setStores] = useState<any[]>([]);
+  const [stores, setStores] = useState<Store[]>([]);
   const [message, setMessage] = useState("");
   const load = useCallback(async () => { const [u, s] = await Promise.all([api("/admin/users", token), api("/admin/stores", token)]); setUsers(u); setStores(s); }, [token]);
   useEffect(() => { load().catch((e) => setMessage(e.message)); }, [load]);
   async function toggle(user: any) { await api(`/admin/users/${user.id}`, token, { method: "PATCH", body: JSON.stringify({ isActive: !user.isActive }) }); await load(); }
   async function reset(user: any) { const password = prompt("Enter a temporary password (12+ characters, upper/lowercase, number and symbol):"); if (!password) return; await api(`/admin/users/${user.id}`, token, { method: "PATCH", body: JSON.stringify({ password }) }); setMessage("Password reset. User must sign in and change it."); }
-  return <><section className="panel"><div className="section-head"><div><h2>Users <span className="count">{users.length}</span></h2><p className="muted">Activate accounts or reset passwords.</p></div></div>{message && <p className="notice">{message}</p>}<div className="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Stores</th><th>Status</th><th>Actions</th></tr></thead><tbody>{users.map((u) => <tr key={u.id}><td><strong>{u.name}</strong><small>{u.email}</small></td><td>{u.role}</td><td>{u._count.stores}</td><td><span className={`badge ${u.isActive ? "connected" : "error"}`}>{u.isActive ? "Active" : "Inactive"}</span></td><td><button className="text-button" onClick={() => toggle(u)}>{u.isActive ? "Deactivate" : "Activate"}</button><button className="text-button" onClick={() => reset(u)}>Reset password</button></td></tr>)}</tbody></table></div></section><section className="panel"><h2>All stores <span className="count">{stores.length}</span></h2><div className="table-wrap"><table><thead><tr><th>Store</th><th>Owner</th><th>Region</th><th>Status</th><th>Refresh expires</th></tr></thead><tbody>{stores.map((s) => <tr key={s.id}><td>{s.label}</td><td>{s.user.email}</td><td>{s.country}</td><td>{s.status}</td><td>{dateLabel(s.refreshExpiresAt)}</td></tr>)}</tbody></table></div></section></>;
+  return <><section className="panel"><div className="section-head"><div><h2>Users <span className="count">{users.length}</span></h2><p className="muted">Activate accounts or reset passwords.</p></div></div>{message && <p className="notice">{message}</p>}<div className="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Stores</th><th>Status</th><th>Actions</th></tr></thead><tbody>{users.map((u) => <tr key={u.id}><td><strong>{u.name}</strong><small>{u.email}</small></td><td>{u.role}</td><td>{u._count.stores}</td><td><span className={`badge ${u.isActive ? "connected" : "error"}`}>{u.isActive ? "Active" : "Inactive"}</span></td><td><button className="text-button" onClick={() => toggle(u)}>{u.isActive ? "Deactivate" : "Activate"}</button><button className="text-button" onClick={() => reset(u)}>Reset password</button></td></tr>)}</tbody></table></div></section><section className="panel"><h2>All stores <span className="count">{stores.length}</span></h2><div className="table-wrap"><table><thead><tr><th>Store</th><th>Seller</th><th>Owner</th><th>Region</th><th>Status</th><th>Refresh expires</th></tr></thead><tbody>{stores.map((s) => <tr key={s.id}><td><button className="link-button" onClick={() => onOpenStore(s)}>{s.label}</button></td><td>{s.sellerName ?? s.account ?? "—"}{s.sellerId && <small>Seller {s.sellerId}</small>}</td><td>{s.user?.email}</td><td>{s.country}</td><td>{s.status}</td><td>{dateLabel(s.refreshExpiresAt)}</td></tr>)}</tbody></table></div></section></>;
 }
 function Audit({ token }: { token: string }) {
-  const [rows, setRows] = useState<Array<{
-    id: string;
-    action: string;
-    createdAt: string;
-    user?: { email: string } | null;
-    store?: { label: string } | null;
-    meta?: { phase?: string; reason?: string } | null;
-  }>>([]);
+  const [rows, setRows] = useState<Array<Activity & { user?: { email: string } | null; store?: { label: string } | null }>>([]);
   useEffect(() => { api("/admin/audit", token).then(setRows).catch(() => setRows([])); }, [token]);
   return <section className="panel"><h2>Recent activity</h2><div className="table-wrap"><table><thead><tr><th>Event</th><th>User</th><th>Store</th><th>Details</th><th>Time</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{row.action.replaceAll("_", " ")}</td><td>{row.user?.email ?? "System"}</td><td>{row.store?.label ?? "—"}</td><td>{row.meta?.reason ? <><strong>{row.meta.phase?.replaceAll("_", " ") ?? "Details"}</strong><small>{row.meta.reason}</small></> : "—"}</td><td>{dateLabel(row.createdAt)}</td></tr>)}</tbody></table></div></section>;
 }

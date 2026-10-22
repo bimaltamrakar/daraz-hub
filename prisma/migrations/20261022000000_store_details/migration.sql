@@ -1,0 +1,16 @@
+ALTER TABLE "Store"
+  ADD COLUMN "account" TEXT,
+  ADD COLUMN "accountPlatform" TEXT,
+  ADD COLUMN "darazCountry" TEXT,
+  ADD COLUMN "darazUserId" TEXT,
+  ADD COLUMN "shortCode" TEXT,
+  ADD COLUMN "connectedAt" TIMESTAMP(3),
+  ADD COLUMN "sellerName" TEXT,
+  ADD COLUMN "companyName" TEXT,
+  ADD COLUMN "sellerEmail" TEXT,
+  ADD COLUMN "sellerStatus" TEXT,
+  ADD COLUMN "verified" BOOLEAN,
+  ADD COLUMN "location" TEXT,
+  ADD COLUMN "profile" JSONB,
+  ADD COLUMN "profileFetchedAt" TIMESTAMP(3),
+  ADD COLUMN "profileError" TEXT;

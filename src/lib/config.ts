@@ -22,15 +22,15 @@ export const config = schema.parse(process.env);
 const darazRegionsJson = config.DARAZ_REGIONS_JSON.trim();
 const darazRegionSchema = z.object({
   authorizeUrl: z.string().url(),
+  // Optional: the per-marketplace REST gateway. Derived from the authorizeUrl host when absent.
   apiBaseUrl: z.string().url().optional(),
+  // Legacy fields kept so existing configurations keep parsing; they are not used.
   tokenUrl: z.string().url().optional(),
   refreshUrl: z.string().url().optional(),
   appKey: z.string().min(1),
   appSecret: z.string().min(1),
   redirectUri: z.string().url(),
   signingMode: z.string().optional(),
-}).refine((region) => Boolean(region.apiBaseUrl || region.tokenUrl), {
-  message: "Each Daraz region must set apiBaseUrl.",
 });
 
 export const darazRegions = z.record(z.string(), darazRegionSchema).parse(darazRegionsJson ? JSON.parse(darazRegionsJson) : {});

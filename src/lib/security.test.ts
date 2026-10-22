@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { decrypt, encrypt } from "./crypto";
-import { createOAuthState, documentedHmac, exchangeAuthorizationCode, refreshDarazToken, regionFor, safeDarazErrorMessage, signLazopRequest } from "./daraz";
+import { apiBaseUrl, createOAuthState, documentedHmac, exchangeAuthorizationCode, fetchSellerProfile, refreshDarazToken, regionFor, safeDarazErrorMessage, signLazopRequest } from "./daraz";
 import { isOAuthStateUsable, isRefreshTokenUsable, ownedStoreFilter } from "./policies";
 
 describe("secret handling", () => {
@@ -159,5 +159,80 @@ describe("Daraz integration configuration", () => {
     const token = await exchangeAuthorizationCode("NP", "auth-code");
     expect(token.refreshToken).toBe("");
     expect(token.refreshExpiresAt.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("derives the per-marketplace REST gateway from the authorize URL when apiBaseUrl is absent", async () => {
+    expect(apiBaseUrl("NP")).toBe("https://api.daraz.com/rest");
+    expect(apiBaseUrl("PK")).toBe("https://api.daraz.pk/rest");
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      access_token: "access", refresh_token: "refresh", expires_in: 3600, refresh_expires_in: 7200,
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await exchangeAuthorizationCode("PK", "auth-code");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.daraz.pk/rest/auth/token/create");
+  });
+
+  it("names the gateway host in network failures", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(Object.assign(new Error("fetch failed"), {
+      cause: Object.assign(new Error("getaddrinfo ENOTFOUND api.daraz.pk"), { code: "ENOTFOUND" }),
+    })));
+    await expect(exchangeAuthorizationCode("PK", "auth-code")).rejects.toThrow(/ENOTFOUND \(host api\.daraz\.pk\)/);
+  });
+
+  it("captures the seller identity Daraz returns with the token", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: "0",
+      access_token: "access", refresh_token: "refresh", expires_in: 3600, refresh_expires_in: 7200,
+      country: "np", account: "seller@example.com", account_platform: "seller_center",
+      country_user_info: [{ country: "pk", seller_id: 1, user_id: 2 }, { country: "np", seller_id: 123, user_id: 456, short_code: "NP123" }],
+    }), { status: 200 })));
+
+    const token = await exchangeAuthorizationCode("NP", "auth-code");
+    expect(token).toMatchObject({ sellerId: "123", darazUserId: "456", shortCode: "NP123", country: "np", account: "seller@example.com", accountPlatform: "seller_center" });
+  });
+
+  it("falls back to the first marketplace entry for cross-border accounts", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      access_token: "access", refresh_token: "refresh", expires_in: 3600, refresh_expires_in: 7200,
+      country: "cb", account_id: 77, country_user_info: [{ country: "pk", seller_id: "9" }],
+    }), { status: 200 })));
+
+    const token = await exchangeAuthorizationCode("NP", "auth-code");
+    expect(token).toMatchObject({ sellerId: "9", country: "pk", darazUserId: "77" });
+  });
+
+  it("fetches the seller profile with a signed GET request", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: "0",
+      data: { seller_id: 123, name: "Kathmandu Outlet", name_company: "Outlet Pvt Ltd", email: "shop@example.com", short_code: "NP123", verified: "true", status: "ACTIVE", location: "Kathmandu", cb: false },
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const profile = await fetchSellerProfile("NP", "access-1");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const requested = new URL(url);
+    expect(`${requested.origin}${requested.pathname}`).toBe("https://api.daraz.com/rest/seller/get");
+    expect(init.method).toBe("GET");
+    expect(init.body).toBeUndefined();
+    expect(requested.searchParams.get("access_token")).toBe("access-1");
+    expect(requested.searchParams.get("sign")).toBe(signLazopRequest("/seller/get", {
+      access_token: "access-1",
+      app_key: "test-app-key",
+      sign_method: "sha256",
+      timestamp: requested.searchParams.get("timestamp")!,
+    }, "test-app-secret"));
+    expect(profile).toMatchObject({ sellerId: "123", name: "Kathmandu Outlet", companyName: "Outlet Pvt Ltd", email: "shop@example.com", shortCode: "NP123", verified: true, status: "ACTIVE", location: "Kathmandu", crossBorder: false });
+    expect(profile.raw).toMatchObject({ seller_id: 123, name: "Kathmandu Outlet" });
+  });
+
+  it("rejects seller profile errors without exposing the access token", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: "IllegalAccessToken", message: "token access-secret-1 is invalid",
+    }), { status: 200 })));
+
+    const failure = fetchSellerProfile("NP", "access-secret-1");
+    await expect(failure).rejects.toThrow(/IllegalAccessToken/);
+    await expect(failure).rejects.not.toThrow(/access-secret-1/);
   });
 });

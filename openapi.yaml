@@ -84,6 +84,13 @@ paths:
       responses:
         "201": { description: Store created }
   /stores/{id}:
+    get:
+      summary: Get an owned store's seller details, token expiry metadata and recent activity
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Store details; credentials omitted }
+        "404": { description: Store not found }
     delete:
       summary: Remove an owned store and its credentials
       parameters:
@@ -91,6 +98,15 @@ paths:
       responses:
         "204": { description: Store removed }
         "404": { description: Store not found }
+  /stores/{id}/profile:
+    post:
+      summary: Re-fetch the seller profile from Daraz (/seller/get) using the stored access token
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Updated store details }
+        "409": { description: No valid access token; refresh or reconnect first }
+        "502": { description: Daraz request failed }
   /stores/{id}/connect:
     post:
       summary: Create single-use OAuth state and return authorization URL
@@ -133,6 +149,14 @@ paths:
       responses:
         "200": { description: User updated }
         "403": { description: Admin role required }
+  /admin/stores/{id}:
+    get:
+      summary: Admin: get any store's details, owner and recent activity (credentials excluded)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Store details }
+        "404": { description: Store not found }
   /admin/stores:
     get:
       summary: Admin: list stores and token status (credentials excluded)

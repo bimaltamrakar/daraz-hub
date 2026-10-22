@@ -54,6 +54,23 @@ model Store {
   country     String
   sellerId    String?
   status      StoreStatus  @default(pending)
+  // Seller identity captured from the Daraz token response at authorization time.
+  account          String?
+  accountPlatform  String?
+  darazCountry     String?
+  darazUserId      String?
+  shortCode        String?
+  connectedAt      DateTime?
+  // Seller profile captured from Daraz /seller/get after authorization.
+  sellerName       String?
+  companyName      String?
+  sellerEmail      String?
+  sellerStatus     String?
+  verified         Boolean?
+  location         String?
+  profile          Json?
+  profileFetchedAt DateTime?
+  profileError     String?
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
   user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
