@@ -3,17 +3,6 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
-    expose:
-      - "4000"
-  nginx:
-    image: nginx:1.27-alpine
-    profiles: ["production"]
-    restart: unless-stopped
-    depends_on:
-      - app
     ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/etc/nginx/certs:ro
+      - "4000:4000"
+    
