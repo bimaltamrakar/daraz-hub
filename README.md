@@ -65,4 +65,4 @@ Set strong unique secrets and `COOKIE_SECURE=true`, ensure the Supabase project 
 - Dashboard: `GET /api/dashboard`. Admin: `GET /api/admin/users`, `/stores`, `/audit`; `PATCH /api/admin/users/:id`.
 - Run `npm test` for security and signing-helper unit tests; `npm run build` for type-check and production build.
 
-The refresh/session cookie is HttpOnly, SameSite=Strict and Secure when configured. Store tokens are encrypted with AES-256-GCM and never returned. Audit logs intentionally exclude credentials and OAuth callback parameters.
+The refresh/session cookie is HttpOnly, SameSite=Strict and Secure when configured. Store tokens are encrypted with AES-256-GCM and never returned. Daraz token exchange and refresh failures record a sanitized phase and reason in the admin activity log; credentials, tokens, and OAuth callback codes are redacted.

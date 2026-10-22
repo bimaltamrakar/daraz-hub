@@ -59,6 +59,17 @@ export function signLazopRequest(path: string, parameters: Record<string, string
     .toUpperCase();
 }
 
+export function safeDarazErrorMessage(country: string, message: string, sensitiveValues: string[] = []) {
+  const region = darazRegions[country.toUpperCase()];
+  const secrets = [region?.appKey, region?.appSecret, ...sensitiveValues].filter((value): value is string => Boolean(value));
+  let safeMessage = message.slice(0, 500);
+  for (const secret of secrets) safeMessage = safeMessage.split(secret).join("[redacted]");
+  return safeMessage.replace(
+    /(?:app_secret|app_key|access_token|refresh_token|code|sign)=([^&\s]+)/gi,
+    (match) => `${match.slice(0, match.indexOf("=") + 1)}[redacted]`,
+  );
+}
+
 async function requestToken(country: string, path: string, tokenParameter: "code" | "refresh_token", value: string): Promise<DarazTokenResponse> {
   const region = regionFor(country);
   const parameters = {
@@ -71,12 +82,26 @@ async function requestToken(country: string, path: string, tokenParameter: "code
     ...parameters,
     sign: signLazopRequest(path, parameters, region.appSecret),
   });
-  const response = await fetch(`${apiBaseUrl(country)}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
-    body: form,
-    signal: AbortSignal.timeout(15000),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl(country)}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body: form,
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (error) {
+    const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
+    const causeCode = cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string"
+      ? cause.code
+      : undefined;
+    const reason = error instanceof Error && error.name === "TimeoutError"
+      ? "request timed out"
+      : causeCode
+        ? `network error ${causeCode}`
+        : "network request failed";
+    throw new Error(`Daraz token API ${reason}. Check outbound HTTPS connectivity, DNS, and TLS from the app container.`);
+  }
 
   if (!response.ok) throw new Error(`Daraz token API returned HTTP ${response.status}.`);
 
@@ -94,7 +119,7 @@ async function requestToken(country: string, path: string, tokenParameter: "code
   const body = responseBody as Record<string, unknown>;
   if (body.code !== undefined && body.code !== 0 && body.code !== "0") {
     const detail = typeof body.message === "string" ? ` ${body.message.slice(0, 200)}` : "";
-    throw new Error(`Daraz token API rejected the request (${String(body.code)}).${detail}`);
+    throw new Error(safeDarazErrorMessage(country, `Daraz token API rejected the request (${String(body.code)}).${detail}`, [value]));
   }
   const tokenData = body.data && typeof body.data === "object" && !Array.isArray(body.data)
     ? body.data

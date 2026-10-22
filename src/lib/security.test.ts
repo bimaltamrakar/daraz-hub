@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { decrypt, encrypt } from "./crypto";
-import { createOAuthState, documentedHmac, exchangeAuthorizationCode, refreshDarazToken, regionFor, signLazopRequest } from "./daraz";
+import { createOAuthState, documentedHmac, exchangeAuthorizationCode, refreshDarazToken, regionFor, safeDarazErrorMessage, signLazopRequest } from "./daraz";
 import { isOAuthStateUsable, isRefreshTokenUsable, ownedStoreFilter } from "./policies";
 
 describe("secret handling", () => {
@@ -54,6 +54,19 @@ describe("Daraz integration configuration", () => {
 
   it("fails closed for an unconfigured marketplace", () => {
     expect(() => regionFor("XX")).toThrow(/not configured/i);
+  });
+
+  it("redacts app credentials, callback codes, and token query parameters from diagnostics", () => {
+    const detail = safeDarazErrorMessage(
+      "NP",
+      "Request failed for code=callback-secret&refresh_token=refresh-secret: app=test-app-secret",
+      ["callback-secret", "refresh-secret"],
+    );
+    expect(detail).not.toContain("callback-secret");
+    expect(detail).not.toContain("refresh-secret");
+    expect(detail).not.toContain("test-app-secret");
+    expect(detail).toContain("code=[redacted]");
+    expect(detail).toContain("refresh_token=[redacted]");
   });
 
   it("uses HMAC-SHA256 with uppercase hex digest", () => {
@@ -123,6 +136,16 @@ describe("Daraz integration configuration", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(exchangeAuthorizationCode("NP", "bad-code")).rejects.toThrow(/IllegalAccessToken/);
+  });
+
+  it("reports the network cause without including submitted credentials", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(Object.assign(new Error("fetch failed"), {
+      cause: Object.assign(new Error("getaddrinfo ENOTFOUND host"), { code: "ENOTFOUND" }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(exchangeAuthorizationCode("NP", "sensitive-code"))
+      .rejects.toThrow(/network error ENOTFOUND/i);
   });
 
   it("accepts a token response that explicitly disables refresh", async () => {

@@ -10,9 +10,9 @@ import { z } from "zod";
 import { db } from "./lib/db";
 import { config } from "./lib/config";
 import { audit } from "./lib/audit";
-import { encrypt, sha256 } from "./lib/crypto";
+import { decrypt, encrypt, sha256 } from "./lib/crypto";
 import { authenticate, activeUser, requireAdmin } from "./lib/auth";
-import { authorizationUrl, createOAuthState, exchangeAuthorizationCode, refreshDarazToken, type DarazTokenResponse } from "./lib/daraz";
+import { authorizationUrl, createOAuthState, exchangeAuthorizationCode, refreshDarazToken, safeDarazErrorMessage, type DarazTokenResponse } from "./lib/daraz";
 import { isOAuthStateUsable, isRefreshTokenUsable, ownedStoreFilter } from "./lib/policies";
 
 const app = express();
@@ -151,7 +151,10 @@ app.get("/api/oauth/daraz/callback", async (req, res) => {
   if (consumed.count !== 1) return res.status(400).send("OAuth state has already been used.");
   if (parsed.data.error) {
     await db.store.update({ where: { id: saved.storeId }, data: { status: "error" } });
-    await audit("store_connection_failed", saved.userId, saved.storeId);
+    await audit("store_connection_failed", saved.userId, saved.storeId, {
+      phase: "authorization",
+      reason: safeDarazErrorMessage(saved.store.country, `Seller authorization was denied (${parsed.data.error}).`),
+    });
     return res.redirect(`${config.APP_ORIGIN}/stores?error=daraz_authorization_denied`);
   }
   if (!parsed.data.code) return res.status(400).send("OAuth callback did not include an authorization code.");
@@ -162,10 +165,11 @@ app.get("/api/oauth/daraz/callback", async (req, res) => {
     return res.redirect(`${config.APP_ORIGIN}/stores?connected=true`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown Daraz token exchange error.";
-    console.error("Daraz token exchange failed:", message.slice(0, 500));
+    const reason = safeDarazErrorMessage(saved.store.country, message, [parsed.data.code]);
+    console.error("Daraz token exchange failed:", reason);
     await db.store.update({ where: { id: saved.storeId }, data: { status: "error" } });
-    await db.storeToken.updateMany({ where: { storeId: saved.storeId }, data: { lastError: message.slice(0, 500) } });
-    await audit("store_connection_failed", saved.userId, saved.storeId);
+    await db.storeToken.updateMany({ where: { storeId: saved.storeId }, data: { lastError: reason } });
+    await audit("store_connection_failed", saved.userId, saved.storeId, { phase: "token_exchange", reason });
     return res.redirect(`${config.APP_ORIGIN}/stores?error=daraz_connection_failed`);
   }
 });
@@ -225,17 +229,19 @@ api.post("/stores/:id/refresh", rateLimit(10, 60000), async (req, res) => {
   const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true } });
   if (!store) return res.status(404).json({ error: "Store not found." });
   if (!store.tokens || !isRefreshTokenUsable(store.tokens.refreshExpiresAt)) return res.status(409).json({ error: "Refresh token has expired. Reconnect this store." });
+  let currentRefresh = "";
   try {
-    const currentRefresh = (await import("./lib/crypto")).decrypt(store.tokens.refreshTokenEnc);
+    currentRefresh = decrypt(store.tokens.refreshTokenEnc);
     const token = await refreshDarazToken(store.country, currentRefresh);
     await saveDarazTokens(store.id, token, true);
     return res.json({ status: "connected", accessExpiresAt: token.accessExpiresAt, refreshExpiresAt: token.refreshExpiresAt });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Daraz token refresh failed.";
+    const reason = safeDarazErrorMessage(store.country, message, [currentRefresh]);
     await db.store.update({ where: { id: store.id }, data: { status: "error" } });
-    await db.storeToken.update({ where: { storeId: store.id }, data: { lastError: message.slice(0, 500) } });
-    await audit("token_refresh_failed", req.auth!.id, store.id, { reason: message.slice(0, 200) });
-    return res.status(502).json({ error: message });
+    await db.storeToken.update({ where: { storeId: store.id }, data: { lastError: reason } });
+    await audit("token_refresh_failed", req.auth!.id, store.id, { phase: "token_refresh", reason });
+    return res.status(502).json({ error: reason });
   }
 });
 api.get("/dashboard", async (req, res) => {
