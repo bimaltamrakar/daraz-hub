@@ -1,4 +1,5 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
+import "./orders.css";
 
 type User = { id: string; name: string; email: string; role: "admin" | "user"; mustChangePassword: boolean };
 type Store = {
@@ -8,12 +9,15 @@ type Store = {
   sellerStatus: string | null; verified: boolean | null; location: string | null; connectedAt: string | null;
   profile: Record<string, unknown> | null; profileFetchedAt: string | null; profileError: string | null;
   accessExpiresAt: string | null; refreshExpiresAt: string | null; lastRefreshedAt: string | null; lastError: string | null;
+  orderSyncFrom: string; orderSyncFrequency: string; orderSyncLastAt: string | null; orderSyncNextAt: string | null;
+  orderSyncError: string | null; orderSyncRunning?: boolean;
   user?: { name: string; email: string };
 };
 type Activity = { id: string; action: string; createdAt: string; meta?: { phase?: string; reason?: string } | null };
 type StoreDetails = Store & { activity: Activity[] };
+type StoreTokens = { accessToken: string; refreshToken: string };
 type Summary = { total: number; connected: number; expiringSoon: number; expired: number };
-type Route = { page: "dashboard" | "stores" | "store" | "admin" | "admin-store" | "audit"; storeId?: string };
+type Route = { page: "dashboard" | "stores" | "store" | "orders" | "admin" | "admin-store" | "audit"; storeId?: string };
 
 const api = async (path: string, token?: string, init: RequestInit = {}) => {
   const response = await fetch(`/api${path}`, {
@@ -34,6 +38,7 @@ function routeFor(pathname: string): Route {
   if (adminStore) return { page: "admin-store", storeId: adminStore[1] };
   if (pathname.startsWith("/admin")) return { page: "admin" };
   if (pathname.startsWith("/audit")) return { page: "audit" };
+  if (pathname.startsWith("/orders")) return { page: "orders" };
   const store = pathname.match(/^\/stores\/([^/]+)/);
   if (store) return { page: "store", storeId: store[1] };
   if (pathname.startsWith("/stores")) return { page: "stores" };
@@ -42,7 +47,7 @@ function routeFor(pathname: string): Route {
 const pathFor = (route: Route) =>
   route.page === "store" ? `/stores/${route.storeId}` : route.page === "admin-store" ? `/admin/stores/${route.storeId}` : route.page === "dashboard" ? "/" : `/${route.page}`;
 const titleFor = (route: Route) =>
-  ({ dashboard: "Overview", stores: "My stores", store: "Store details", admin: "Administration", "admin-store": "Store details", audit: "Audit log" })[route.page];
+  ({ dashboard: "Overview", stores: "My stores", store: "Store details", orders: "Orders", admin: "Administration", "admin-store": "Store details", audit: "Audit log" })[route.page];
 
 export default function App() {
   const [token, setToken] = useState("");
@@ -167,6 +172,7 @@ export default function App() {
       <div className="nav-caption">WORKSPACE</div>
       <button className={page === "dashboard" ? "nav active" : "nav"} onClick={() => navigate({ page: "dashboard" })}>◫ &nbsp;Overview</button>
       <button className={page === "stores" || page === "store" ? "nav active" : "nav"} onClick={() => navigate({ page: "stores" })}>▤ &nbsp;My stores</button>
+      <button className={page === "orders" ? "nav active" : "nav"} onClick={() => navigate({ page: "orders" })}>▣ &nbsp;Orders</button>
       {user.role === "admin" && <><div className="nav-caption">ADMINISTRATION</div><button className={isAdminPage ? "nav active" : "nav"} onClick={() => navigate({ page: "admin" })}>♙ &nbsp;Users & stores</button><button className={page === "audit" ? "nav active" : "nav"} onClick={() => navigate({ page: "audit" })}>◷ &nbsp;Audit log</button></>}
       <div className="profile"><span className="avatar">{user.name[0]?.toUpperCase()}</span><div className="profile-text"><strong>{user.name}</strong><small>{user.email}</small></div><button className="icon-button" aria-label="Sign out" onClick={logout}>↗</button></div>
     </aside>
@@ -184,8 +190,9 @@ export default function App() {
         <section className="panel"><div className="section-head"><div><h2>Your stores <span className="count">{stores.length}</span></h2><p className="muted">Click a store name for its seller details and connection history.</p></div></div>{stores.length ? <StoreList stores={stores} onOpen={openStore} onConnect={connect} onRefresh={refresh} onRemove={remove} /> : <EmptyStores onClick={() => document.querySelector<HTMLInputElement>('input[name="label"]')?.focus()} />}</section>
       </> : page === "store" ? <StoreDetail key={route.storeId} token={token} storeId={route.storeId!} onBack={() => navigate({ page: "stores" })} onConnect={connect} onRefresh={refresh} onRemove={async (store) => { if (await remove(store)) navigate({ page: "stores" }); }} onNotice={setNotice} />
       : page === "admin-store" ? <StoreDetail key={route.storeId} token={token} storeId={route.storeId!} admin onBack={() => navigate({ page: "admin" })} onNotice={setNotice} />
+      : page === "orders" ? <Orders token={token} stores={stores} />
       : page === "admin" ? <Admin token={token} onOpenStore={(store) => navigate({ page: "admin-store", storeId: store.id })} /> : <Audit token={token} />}
-      <footer>Daraz Store Hub <span>Tokens are encrypted at rest and never shown in the browser.</span></footer>
+      <footer>Daraz Store Hub <span>Tokens are encrypted at rest and revealed only on request.</span></footer>
     </main>
   </div>;
 }
@@ -206,11 +213,19 @@ function StoreDetail({ token, storeId, admin = false, onBack, onConnect, onRefre
   onConnect?: (store: Store) => void; onRefresh?: (store: Store) => Promise<void>; onRemove?: (store: Store) => Promise<void>; onNotice: (message: string) => void;
 }) {
   const [store, setStore] = useState<StoreDetails | null>(null);
+  const [storeTokens, setStoreTokens] = useState<StoreTokens | null>(null);
+  const [tokensLoading, setTokensLoading] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const path = admin ? `/admin/stores/${storeId}` : `/stores/${storeId}`;
   const reload = useCallback(() => api(path, token).then((data) => { setStore(data); setError(""); }).catch((e) => setError(e.message)), [path, token]);
   useEffect(() => { reload(); }, [reload]);
+  const syncQueued = Boolean(store?.orderSyncNextAt && new Date(store.orderSyncNextAt).getTime() <= Date.now());
+  useEffect(() => {
+    if (!store?.orderSyncRunning && !syncQueued) return;
+    const timer = setInterval(() => { void reload(); }, 5000);
+    return () => clearInterval(timer);
+  }, [store?.orderSyncRunning, syncQueued, reload]);
 
   async function refreshProfile() {
     if (!store) return;
@@ -222,7 +237,53 @@ function StoreDetail({ token, storeId, admin = false, onBack, onConnect, onRefre
   async function refreshToken() {
     if (!store || !onRefresh) return;
     setBusy(true);
-    try { await onRefresh(store); await reload(); } finally { setBusy(false); }
+    try { await onRefresh(store); setStoreTokens(null); await reload(); } finally { setBusy(false); }
+  }
+  async function toggleStoreTokens() {
+    if (storeTokens) {
+      setStoreTokens(null);
+      return;
+    }
+    setTokensLoading(true);
+    try {
+      const credentials = await api(`/stores/${storeId}/tokens`, token, { cache: "no-store" });
+      setStoreTokens(credentials);
+    } catch (e) {
+      onNotice(e instanceof Error ? e.message : "Unable to reveal store tokens.");
+    } finally {
+      setTokensLoading(false);
+    }
+  }
+  async function saveOrderSyncSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!store) return;
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    setBusy(true);
+    try {
+      await api(`/stores/${store.id}/order-sync-settings`, token, {
+        method: "PATCH",
+        body: JSON.stringify({ fromDate: values.fromDate, frequency: values.frequency }),
+      });
+      await reload();
+      onNotice("Order sync settings saved.");
+    } catch (e) {
+      onNotice(e instanceof Error ? e.message : "Unable to save order sync settings.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function syncOrdersNow() {
+    if (!store) return;
+    setBusy(true);
+    try {
+      await api(`/stores/${store.id}/orders/sync`, token, { method: "POST" });
+      await reload();
+      onNotice("Order and product sync queued.");
+    } catch (e) {
+      onNotice(e instanceof Error ? e.message : "Unable to queue order sync.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   const back = <button className="back-button" onClick={onBack}>← {admin ? "All stores" : "My stores"}</button>;
@@ -245,15 +306,130 @@ function StoreDetail({ token, storeId, admin = false, onBack, onConnect, onRefre
         ["Details fetched", store.profileFetchedAt ? dateLabel(store.profileFetchedAt) : null], ...(store.profileError ? [["Profile error", store.profileError, "warning"] as [string, ReactNode, string]] : []),
       ]} />
     </section>
-    <section className="panel"><h2>Connection & tokens</h2><p className="muted">Token values are encrypted at rest and never shown here.</p>
+    <section className="panel"><h2>Connection & tokens</h2><p className="muted">Tokens are encrypted at rest. Reveal them only when needed, and keep them private.</p>
       <Details rows={[
         ["Status", store.status.replace("_", " ")], ["First connected", store.connectedAt ? dateLabel(store.connectedAt) : null], ["Access token expires", dateLabel(store.accessExpiresAt)],
         ["Refresh token expires", dateLabel(store.refreshExpiresAt)], ["Last token refresh", store.lastRefreshedAt ? dateLabel(store.lastRefreshedAt) : "Never"], ["Store added", dateLabel(store.createdAt)],
         ...(store.lastError ? [["Last error", store.lastError, "warning"] as [string, ReactNode, string]] : []),
       ]} />
+      {!admin && <div className="token-controls">
+        <button className="secondary" disabled={tokensLoading} onClick={toggleStoreTokens}>
+          {tokensLoading ? "Loading tokens…" : storeTokens ? "Hide tokens" : "Show tokens"}
+        </button>
+        {storeTokens && <div className="token-values">
+          <label>Access token<input type="text" readOnly autoComplete="off" spellCheck={false} value={storeTokens.accessToken} /></label>
+          <label>Refresh token<input type="text" readOnly autoComplete="off" spellCheck={false} value={storeTokens.refreshToken} /></label>
+        </div>}
+      </div>}
       {refreshDays !== null && refreshDays <= 7 && <p className="notice">Refresh token expires in {Math.max(refreshDays, 0)} days — reconnect soon.</p>}
     </section>
+    {!admin && <section className="panel">
+      <div className="section-head"><div><h2>Order & product sync</h2><p className="muted">Orders and their product details are saved locally and refreshed on this schedule.</p></div>
+        <button disabled={busy || store.orderSyncRunning || !store.accessExpiresAt && !store.refreshExpiresAt} onClick={syncOrdersNow}>{store.orderSyncRunning ? "Syncing…" : "Sync now"}</button>
+      </div>
+      <form className="sync-settings" onSubmit={saveOrderSyncSettings}>
+        <label>Sync orders from<input required type="date" name="fromDate" max={new Date().toISOString().slice(0, 10)} defaultValue={store.orderSyncFrom?.slice(0, 10)} /></label>
+        <label>Sync frequency<select name="frequency" defaultValue={store.orderSyncFrequency}>
+          <option value="manual">Manual only</option><option value="every_15_minutes">Every 15 minutes</option>
+          <option value="hourly">Hourly</option><option value="every_6_hours">Every 6 hours</option><option value="daily">Daily</option>
+        </select></label>
+        <button className="secondary" disabled={busy}>Save settings</button>
+      </form>
+      <Details rows={[
+        ["Last sync", store.orderSyncLastAt ? dateLabel(store.orderSyncLastAt) : "Never"],
+        ["Next sync", store.orderSyncNextAt ? dateLabel(store.orderSyncNextAt) : store.orderSyncFrequency === "manual" ? "Manual only" : "Not scheduled"],
+        ["Sync status", store.orderSyncRunning ? "Running" : syncQueued ? "Queued" : store.orderSyncError ? "Needs attention" : "Idle"],
+        ...(store.orderSyncError ? [["Sync error", store.orderSyncError, "warning"] as [string, ReactNode, string]] : []),
+      ]} />
+    </section>}
     <section className="panel"><h2>Recent activity</h2>{store.activity.length ? <div className="table-wrap"><table><thead><tr><th>Event</th><th>Details</th><th>Time</th></tr></thead><tbody>{store.activity.map((row) => <tr key={row.id}><td>{row.action.replaceAll("_", " ")}</td><td>{row.meta?.reason ? <><strong>{row.meta.phase?.replaceAll("_", " ") ?? "Details"}</strong><small>{row.meta.reason}</small></> : "—"}</td><td>{dateLabel(row.createdAt)}</td></tr>)}</tbody></table></div> : <p className="muted">No activity recorded yet.</p>}</section>
+  </>;
+}
+
+type OrderRow = {
+  id: string; storeId: string; darazOrderId: string; customerName: string | null;
+  orderCreatedAt: string; orderUpdatedAt: string | null; orderStatus: string | null;
+  deliveryStatus: string | null; trackingNumber: string | null;
+  store: { label: string; country: string };
+};
+
+function Orders({ token, stores }: { token: string; stores: Store[] }) {
+  const [rows, setRows] = useState<OrderRow[]>([]);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const [storeId, setStoreId] = useState("");
+  const [search, setSearch] = useState("");
+  const [orderStatus, setOrderStatus] = useState("");
+  const [deliveryStatus, setDeliveryStatus] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [sortBy, setSortBy] = useState("createdAt");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const params = new URLSearchParams({
+      page: String(page), pageSize: String(pageSize), sortBy, sortOrder,
+    });
+    if (storeId) params.set("storeId", storeId);
+    if (search) params.set("search", search);
+    if (orderStatus) params.set("orderStatus", orderStatus);
+    if (deliveryStatus) params.set("deliveryStatus", deliveryStatus);
+    if (from) params.set("from", from);
+    if (to) params.set("to", to);
+    let current = true;
+    setLoading(true);
+    api(`/orders?${params}`, token).then((data) => {
+      if (!current) return;
+      setRows(data.orders);
+      setTotal(data.total);
+      setTotalPages(data.totalPages);
+      setError("");
+    }).catch((e) => {
+      if (current) setError(e instanceof Error ? e.message : "Unable to load orders.");
+    }).finally(() => { if (current) setLoading(false); });
+    return () => { current = false; };
+  }, [token, page, pageSize, storeId, search, orderStatus, deliveryStatus, from, to, sortBy, sortOrder]);
+
+  function toggleSort(field: string) {
+    if (sortBy === field) setSortOrder(sortOrder === "asc" ? "desc" : "asc");
+    else { setSortBy(field); setSortOrder("asc"); }
+    setPage(1);
+  }
+  const sortable = (field: string, title: string) =>
+    <button className="table-sort" onClick={() => toggleSort(field)}>{title}{sortBy === field ? (sortOrder === "asc" ? " ↑" : " ↓") : ""}</button>;
+  const pageText = total === 0 ? "0 orders" : `${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, total)} of ${total}`;
+
+  return <>
+    <section className="panel">
+      <div className="section-head"><div><h2>Orders <span className="count">{total}</span></h2><p className="muted">Synced orders and their latest Daraz status.</p></div></div>
+      <div className="order-filters">
+        <label>Store<select value={storeId} onChange={(event) => { setStoreId(event.target.value); setPage(1); }}>
+          <option value="">All stores</option>{stores.map((store) => <option key={store.id} value={store.id}>{store.label} ({store.country})</option>)}
+        </select></label>
+        <label>Search<input type="search" maxLength={200} placeholder="Order, customer or tracking number" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} /></label>
+        <label>Order status<input maxLength={100} value={orderStatus} placeholder="Any status" onChange={(event) => { setOrderStatus(event.target.value); setPage(1); }} /></label>
+        <label>Delivery status<input maxLength={100} value={deliveryStatus} placeholder="Any status" onChange={(event) => { setDeliveryStatus(event.target.value); setPage(1); }} /></label>
+        <label>Created from<input type="date" value={from} onChange={(event) => { setFrom(event.target.value); setPage(1); }} /></label>
+        <label>Created to<input type="date" value={to} onChange={(event) => { setTo(event.target.value); setPage(1); }} /></label>
+        <label>Rows<select value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value)); setPage(1); }}><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label>
+      </div>
+      {error && <p className="notice error">{error}</p>}
+      <div className="table-wrap orders-table"><table>
+        <thead><tr><th>{sortable("customerName", "Customer")}</th><th>{sortable("orderId", "Order ID")}</th><th>Store</th><th>{sortable("createdAt", "Created")}</th><th>{sortable("updatedAt", "Updated")}</th><th>{sortable("orderStatus", "Order status")}</th><th>{sortable("deliveryStatus", "Delivery status")}</th><th>{sortable("trackingNumber", "Tracking number")}</th></tr></thead>
+        <tbody>{rows.map((order) => <tr key={order.id}>
+          <td>{order.customerName ?? "—"}</td><td>{order.darazOrderId}</td><td>{order.store.label}</td>
+          <td>{dateLabel(order.orderCreatedAt)}</td><td>{dateLabel(order.orderUpdatedAt)}</td>
+          <td>{order.orderStatus ?? "—"}</td><td>{order.deliveryStatus ?? "—"}</td><td>{order.trackingNumber ?? "—"}</td>
+        </tr>)}
+        {!loading && rows.length === 0 && <tr><td colSpan={8} className="orders-empty">No orders found. Connect a store and run an order sync, or adjust the filters.</td></tr>}
+        {loading && <tr><td colSpan={8} className="orders-empty">Loading orders…</td></tr>}
+        </tbody></table></div>
+      <div className="pagination"><span>{pageText}</span><div><button className="secondary" disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {Math.max(totalPages, 1)}</span><button className="secondary" disabled={page >= totalPages || loading} onClick={() => setPage(page + 1)}>Next</button></div></div>
+    </section>
   </>;
 }
 

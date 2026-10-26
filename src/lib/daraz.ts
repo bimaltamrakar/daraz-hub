@@ -221,6 +221,42 @@ export function refreshDarazToken(country: string, refreshToken: string) {
   return requestToken(country, "/auth/token/refresh", "refresh_token", refreshToken);
 }
 
+export function fetchDarazOrders(
+  country: string,
+  accessToken: string,
+  options: { createdAfter: string; limit: number; offset: number },
+) {
+  return callDaraz(country, "/orders/get", "GET", {
+    access_token: accessToken,
+    CreatedAfter: options.createdAfter,
+    limit: String(options.limit),
+    offset: String(options.offset),
+    sort_by: "updated_at",
+  }, [accessToken]);
+}
+
+export function fetchDarazOrderDetails(country: string, accessToken: string, orderId: string) {
+  return callDaraz(country, "/order/get", "GET", { access_token: accessToken, order_id: orderId }, [accessToken]);
+}
+
+export function fetchDarazProductDetails(country: string, accessToken: string, itemId: string) {
+  return callDaraz(country, "/product/item/get", "GET", { access_token: accessToken, item_id: itemId }, [accessToken]);
+}
+
+export function fetchDarazProducts(
+  country: string,
+  accessToken: string,
+  options: { updatedAfter?: string; limit: number; offset: number },
+) {
+  return callDaraz(country, "/products/get", "GET", {
+    access_token: accessToken,
+    filter: "all",
+    ...(options.updatedAfter ? { update_after: options.updatedAfter } : {}),
+    limit: String(options.limit),
+    offset: String(options.offset),
+  }, [accessToken]);
+}
+
 const toBoolean = (value: boolean | string | undefined) =>
   value === undefined ? undefined : typeof value === "boolean" ? value : value.toLowerCase() === "true";
 

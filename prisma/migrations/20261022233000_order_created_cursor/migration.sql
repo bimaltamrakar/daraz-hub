@@ -1,0 +1,2 @@
+ALTER TABLE "Store"
+ADD COLUMN "orderSyncCursor" TIMESTAMP(3);

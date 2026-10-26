@@ -7,7 +7,7 @@ import jwt from "jsonwebtoken";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
-import type { Prisma, StoreToken } from "@prisma/client";
+import { OrderSyncFrequency, type Prisma, type StoreToken } from "@prisma/client";
 import { db } from "./lib/db";
 import { config } from "./lib/config";
 import { audit } from "./lib/audit";
@@ -15,6 +15,7 @@ import { decrypt, encrypt, sha256 } from "./lib/crypto";
 import { authenticate, activeUser, requireAdmin } from "./lib/auth";
 import { authorizationUrl, createOAuthState, exchangeAuthorizationCode, fetchSellerProfile, refreshDarazToken, safeDarazErrorMessage, type DarazTokenResponse } from "./lib/daraz";
 import { isOAuthStateUsable, isRefreshTokenUsable, ownedStoreFilter } from "./lib/policies";
+import { orderSyncFrequencies, queueStoreOrderSync, startOrderSyncWorker } from "./lib/order-sync";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -67,8 +68,10 @@ const defined = <T extends object>(object: T) =>
   Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined)) as { [K in keyof T]?: Exclude<T[K], undefined> };
 /** Store representation returned to the browser: every column except token ciphertext. */
 function publicStore<T extends { tokens: StoreToken | null; status: string }>({ tokens, ...store }: T) {
+  const { orderSyncLockId, orderSyncLockUntil, ...visibleStore } = store as T & { orderSyncLockId?: string | null; orderSyncLockUntil?: Date | null };
   return {
-    ...store,
+    ...visibleStore,
+    orderSyncRunning: Boolean(orderSyncLockUntil && orderSyncLockUntil > new Date()),
     status: displayStoreStatus({ status: store.status, tokens }),
     accessExpiresAt: tokens?.accessExpiresAt ?? null,
     refreshExpiresAt: tokens?.refreshExpiresAt ?? null,
@@ -78,6 +81,10 @@ function publicStore<T extends { tokens: StoreToken | null; status: string }>({ 
 }
 const storeActivity = { orderBy: { createdAt: "desc" }, take: 20, select: { id: true, action: true, meta: true, createdAt: true } } as const;
 async function saveDarazTokens(storeId: string, tokens: DarazTokenResponse, refreshed: boolean) {
+  const syncSettings = refreshed ? null : await db.store.findUniqueOrThrow({
+    where: { id: storeId },
+    select: { orderSyncFrequency: true },
+  });
   const tokenData = {
     accessTokenEnc: encrypt(tokens.accessToken),
     refreshTokenEnc: encrypt(tokens.refreshToken),
@@ -97,6 +104,7 @@ async function saveDarazTokens(storeId: string, tokens: DarazTokenResponse, refr
       data: {
         status: "connected",
         ...(refreshed ? {} : { connectedAt: new Date() }),
+        ...(!refreshed ? { orderSyncNextAt: syncSettings?.orderSyncFrequency === "manual" ? null : new Date() } : {}),
         // Seller identity reported by Daraz alongside the token; saved at authorization time.
         ...defined({
           sellerId: tokens.sellerId,
@@ -254,7 +262,7 @@ app.get("/api/oauth/daraz/callback", async (req, res) => {
   return res.redirect(`${storePage}?connected=${profile.ok ? "true" : "partial"}`);
 });
 
-app.get("/api/openapi.yaml", (_req, res) => res.sendFile(path.resolve(__dirname, "../openapi.yaml")));
+app.get("/api/openapi.yaml", (_req, res) => res.sendFile(path.resolve(process.cwd(), "openapi.yaml")));
 app.get("/api/openapi.json", (_req, res) => res.json({
   openapi: "3.1.0", info: { title: "Daraz Store Hub API", version: "1.0.0" },
   servers: [{ url: "/api" }],
@@ -263,9 +271,16 @@ app.get("/api/openapi.json", (_req, res) => res.json({
     "/auth/login": { post: { summary: "Sign in" } },
     "/stores": { get: { summary: "List own stores" }, post: { summary: "Add store" } },
     "/stores/{id}": { get: { summary: "Store details and recent activity" }, delete: { summary: "Remove store" } },
+    "/stores/{id}/tokens": { get: { summary: "Reveal tokens for an owned store on demand" } },
     "/stores/{id}/connect": { post: { summary: "Start Daraz OAuth" } },
     "/stores/{id}/refresh": { post: { summary: "Refresh store token" } },
     "/stores/{id}/profile": { post: { summary: "Re-fetch seller profile from Daraz" } },
+    "/stores/{id}/order-sync-settings": { patch: { summary: "Configure order sync" } },
+    "/stores/{id}/orders/sync": { post: { summary: "Queue order and product sync" } },
+    "/orders": { get: { summary: "Search, filter, sort, and paginate owned orders" } },
+    "/orders/{id}": { get: { summary: "Get an owned order and its full Daraz details" } },
+    "/products": { get: { summary: "Search and paginate owned product master" } },
+    "/products/{id}": { get: { summary: "Get an owned product and its full Daraz details" } },
     "/admin/users": { get: { summary: "Admin: list users" } },
     "/admin/stores": { get: { summary: "Admin: list stores" } },
     "/admin/stores/{id}": { get: { summary: "Admin: store details" } },
@@ -279,12 +294,73 @@ api.get("/stores", async (req, res) => {
   const stores = await db.store.findMany({ where: { userId: req.auth!.id }, include: { tokens: true }, orderBy: { createdAt: "desc" } });
   return res.json(stores.map(publicStore));
 });
+api.patch("/stores/:id/order-sync-settings", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value && parsed <= new Date();
+  });
+  const parsed = z.object({
+    fromDate: dateSchema,
+    frequency: z.nativeEnum(OrderSyncFrequency),
+  }).safeParse(req.body);
+  if (!parsed.success || !orderSyncFrequencies.includes(parsed.data.frequency)) {
+    return res.status(400).json({ error: "Provide a valid sync start date and frequency." });
+  }
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id) });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  if (store.orderSyncLockUntil && store.orderSyncLockUntil > new Date()) {
+    return res.status(409).json({ error: "Wait for the current order sync to finish before changing its settings." });
+  }
+  const fromDate = new Date(`${parsed.data.fromDate}T00:00:00.000Z`);
+  const updateResult = await db.store.updateMany({
+    where: {
+      id: store.id,
+      userId: req.auth!.id,
+      OR: [{ orderSyncLockUntil: null }, { orderSyncLockUntil: { lt: new Date() } }],
+    },
+    data: {
+      orderSyncFrom: fromDate,
+      orderSyncFrequency: parsed.data.frequency,
+      ...(store.orderSyncFrom.getTime() !== fromDate.getTime() ? { orderSyncCursor: null, orderSyncLastAt: null } : {}),
+      orderSyncNextAt: parsed.data.frequency === "manual" ? null : new Date(),
+      orderSyncError: null,
+    },
+  });
+  if (updateResult.count !== 1) return res.status(409).json({ error: "Wait for the current order sync to finish before changing its settings." });
+  const updated = await db.store.findUniqueOrThrow({ where: { id: store.id }, include: { tokens: true } });
+  return res.json(publicStore(updated));
+});
+api.post("/stores/:id/orders/sync", rateLimit(5, 60000), async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true } });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  if (!store.tokens) return res.status(409).json({ error: "Connect this store before syncing orders." });
+  if (!(await queueStoreOrderSync(store.id))) return res.status(409).json({ error: "An order sync is already running for this store." });
+  return res.status(202).json({ status: "queued", message: "Order and product sync has been queued." });
+});
 api.get("/stores/:id", async (req, res) => {
   const id = typeof req.params.id === "string" ? req.params.id : "";
   const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true, auditLogs: storeActivity } });
   if (!store) return res.status(404).json({ error: "Store not found." });
   const { auditLogs, ...rest } = store;
   return res.json({ ...publicStore(rest), activity: auditLogs });
+});
+api.get("/stores/:id/tokens", rateLimit(10, 60000), async (req, res) => {
+  res.set("Cache-Control", "no-store, private");
+  res.set("Pragma", "no-cache");
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const store = await db.store.findFirst({
+    where: ownedStoreFilter(id, req.auth!.id),
+    include: { tokens: true },
+  });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  if (!store.tokens) return res.status(409).json({ error: "This store has no Daraz tokens. Connect it first." });
+
+  const accessToken = decrypt(store.tokens.accessTokenEnc);
+  const refreshToken = decrypt(store.tokens.refreshTokenEnc);
+  await audit("store_tokens_viewed", req.auth!.id, store.id);
+  return res.json({ accessToken, refreshToken });
 });
 api.post("/stores/:id/profile", rateLimit(10, 60000), async (req, res) => {
   const id = typeof req.params.id === "string" ? req.params.id : "";
@@ -358,6 +434,111 @@ api.get("/dashboard", async (req, res) => {
   }
   return res.json(summary);
 });
+const orderSortFields = {
+  customerName: "customerName",
+  orderId: "darazOrderId",
+  createdAt: "orderCreatedAt",
+  updatedAt: "orderUpdatedAt",
+  orderStatus: "orderStatus",
+  deliveryStatus: "deliveryStatus",
+  trackingNumber: "trackingNumber",
+} as const;
+api.get("/orders", async (req, res) => {
+  const parsed = z.object({
+    page: z.coerce.number().int().min(1).max(1_000_000).default(1),
+    pageSize: z.coerce.number().int().min(1).max(100).default(25),
+    storeId: z.string().optional(),
+    search: z.string().trim().max(200).optional(),
+    orderStatus: z.string().trim().max(100).optional(),
+    deliveryStatus: z.string().trim().max(100).optional(),
+    from: z.string().date().optional(),
+    to: z.string().date().optional(),
+    sortBy: z.enum(["customerName", "orderId", "createdAt", "updatedAt", "orderStatus", "deliveryStatus", "trackingNumber"]).default("createdAt"),
+    sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid order list filters." });
+  const filters = parsed.data;
+  if (filters.from && filters.to && filters.from > filters.to) return res.status(400).json({ error: "The start date must be before the end date." });
+  if (filters.storeId) {
+    const ownedStore = await db.store.findFirst({ where: ownedStoreFilter(filters.storeId, req.auth!.id), select: { id: true } });
+    if (!ownedStore) return res.status(404).json({ error: "Store not found." });
+  }
+  const where: Prisma.StoreOrderWhereInput = {
+    store: { userId: req.auth!.id, ...(filters.storeId ? { id: filters.storeId } : {}) },
+    ...(filters.orderStatus ? { orderStatus: { equals: filters.orderStatus, mode: "insensitive" } } : {}),
+    ...(filters.deliveryStatus ? { deliveryStatus: { equals: filters.deliveryStatus, mode: "insensitive" } } : {}),
+    ...(filters.search ? {
+      OR: [
+        { darazOrderId: { contains: filters.search, mode: "insensitive" } },
+        { customerName: { contains: filters.search, mode: "insensitive" } },
+        { trackingNumber: { contains: filters.search, mode: "insensitive" } },
+      ],
+    } : {}),
+    ...(filters.from || filters.to ? {
+      orderCreatedAt: {
+        ...(filters.from ? { gte: new Date(`${filters.from}T00:00:00.000Z`) } : {}),
+        ...(filters.to ? { lt: new Date(new Date(`${filters.to}T00:00:00.000Z`).getTime() + 86400000) } : {}),
+      },
+    } : {}),
+  };
+  const [total, orders] = await Promise.all([
+    db.storeOrder.count({ where }),
+    db.storeOrder.findMany({
+      where,
+      orderBy: [{ [orderSortFields[filters.sortBy]]: filters.sortOrder }, { id: "asc" }],
+      skip: (filters.page - 1) * filters.pageSize,
+      take: filters.pageSize,
+      select: {
+        id: true, storeId: true, darazOrderId: true, customerName: true,
+        orderCreatedAt: true, orderUpdatedAt: true, orderStatus: true,
+        deliveryStatus: true, trackingNumber: true, syncedAt: true,
+        store: { select: { label: true, country: true } },
+      },
+    }),
+  ]);
+  return res.json({ orders, page: filters.page, pageSize: filters.pageSize, total, totalPages: Math.ceil(total / filters.pageSize) });
+});
+api.get("/orders/:id", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const order = await db.storeOrder.findFirst({ where: { id, store: { userId: req.auth!.id } } });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  return res.json(order);
+});
+api.get("/products", async (req, res) => {
+  const parsed = z.object({
+    page: z.coerce.number().int().min(1).max(1_000_000).default(1),
+    pageSize: z.coerce.number().int().min(1).max(100).default(25),
+    storeId: z.string().optional(),
+    search: z.string().trim().max(200).optional(),
+  }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid product list filters." });
+  const { page, pageSize, storeId, search } = parsed.data;
+  if (storeId && !(await db.store.findFirst({ where: ownedStoreFilter(storeId, req.auth!.id), select: { id: true } }))) {
+    return res.status(404).json({ error: "Store not found." });
+  }
+  const where: Prisma.ProductMasterWhereInput = {
+    store: { userId: req.auth!.id, ...(storeId ? { id: storeId } : {}) },
+    ...(search ? { OR: [
+      { darazItemId: { contains: search, mode: "insensitive" } },
+      { sellerSku: { contains: search, mode: "insensitive" } },
+      { name: { contains: search, mode: "insensitive" } },
+    ] } : {}),
+  };
+  const [total, products] = await Promise.all([
+    db.productMaster.count({ where }),
+    db.productMaster.findMany({
+      where, orderBy: { name: "asc" }, skip: (page - 1) * pageSize, take: pageSize,
+      select: { id: true, storeId: true, darazItemId: true, sellerSku: true, name: true, status: true, fetchedAt: true, store: { select: { label: true, country: true } } },
+    }),
+  ]);
+  return res.json({ products, page, pageSize, total, totalPages: Math.ceil(total / pageSize) });
+});
+api.get("/products/:id", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const product = await db.productMaster.findFirst({ where: { id, store: { userId: req.auth!.id } } });
+  if (!product) return res.status(404).json({ error: "Product not found." });
+  return res.json(product);
+});
 
 api.get("/admin/users", requireAdmin, async (_req, res) => {
   const users = await db.user.findMany({ select: { id: true, name: true, email: true, role: true, isActive: true, createdAt: true, _count: { select: { stores: true } } }, orderBy: { createdAt: "desc" } });
@@ -403,4 +584,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   else console.error("Unhandled request error: unknown error");
   return res.status(500).json({ error: "An unexpected error occurred." });
 });
-app.listen(config.PORT, () => console.log(`Daraz Store Hub API listening on ${config.PORT}`));
+app.listen(config.PORT, () => {
+  console.log(`Daraz Store Hub API listening on ${config.PORT}`);
+  startOrderSyncWorker();
+});
