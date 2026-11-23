@@ -1066,6 +1066,14 @@ function StatusBadge({ group }: { group?: string | null }) {
   return <span className={`badge ${group ?? "unknown"}`}>{(group ?? "unknown").replaceAll("_", " ")}</span>;
 }
 
+function OrderStatusBadge({ order }: { order: OrderRow }) {
+  const raw = (order.orderStatus ?? "").toLowerCase();
+  if (order.statusGroup === "unpaid" && raw.includes("pending")) return <span className="badge to_ship">To Pack</span>;
+  if (order.statusGroup === "to_ship" && raw.includes("packed")) return <span className="badge to_ship">To Arrange Shipment</span>;
+  if (order.statusGroup === "to_ship" && raw.includes("ready_to_ship")) return <span className="badge to_ship">To Handover</span>;
+  return <StatusBadge group={order.statusGroup} />;
+}
+
 function Orders({ token, stores }: { token: string; stores: Store[] }) {
   const [rows, setRows] = useState<OrderRow[]>([]);
   const [summary, setSummary] = useState<OrderSummary | null>(null);
@@ -1171,7 +1179,7 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
       </div>
 
       {statusGroup === "to_ship" && <div className="substatus-row">
-        {[["", "All"], ["pending", "Pending"], ["ready_to_ship", "Ready to Ship"], ["packed", "Packed"]].map(([key, label]) => {
+        {[["", "All"], ["to_pack", "To Pack"], ["to_arrange", "To Arrange Shipment"], ["to_handover", "To Handover"]].map(([key, label]) => {
           const count = storeId && summary?.toShip ? (key ? summary.toShip[key] ?? 0 : counts.to_ship ?? 0) : null;
           return <button key={key || "all"} className={orderStatus === key ? "substatus active" : "substatus"} onClick={() => { setOrderStatus(key); setPage(1); }}>
             {label}{count !== null && count > 0 && <span className="tab-count">{count.toLocaleString()}</span>}
@@ -1206,7 +1214,7 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
           <td>{order.customerName ?? "—"}</td>
           <td>{order.itemCount ?? "—"}</td>
           <td className="money">{formatMoney(order.amount)}</td>
-          <td><StatusBadge group={order.statusGroup} /></td>
+          <td><OrderStatusBadge order={order} /></td>
           <td>{order.deliveryStatus ?? "—"}</td>
           <td>{order.trackingNumber ?? "—"}</td>
         </tr>)}

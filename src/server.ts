@@ -582,10 +582,40 @@ function orderWhere(filters: z.infer<typeof orderListFilters>, userId: string): 
   const where: Prisma.StoreOrderWhereInput = {
     store: { userId, isActive: true, ...(filters.storeId ? { id: filters.storeId } : {}) },
   };
-  // "All" includes every status (including canceled); a specific lane filters to that status.
-  // Canceled orders stay out of dashboard metrics/reports.
-  if (filters.statusGroup) where.statusGroup = filters.statusGroup;
-  if (filters.orderStatus) where.orderStatus = { contains: filters.orderStatus, mode: "insensitive" };
+  const and: Prisma.StoreOrderWhereInput[] = [];
+  // Daraz's To Ship lane contains pending (to pack), packed (to arrange shipment) and
+  // ready_to_ship (to handover) orders, even when the raw status list also includes delivered.
+  if (filters.statusGroup === "to_ship") {
+    and.push({ OR: [
+      { statusGroup: "unpaid", orderStatus: { contains: "pending", mode: "insensitive" } },
+      { statusGroup: "to_ship", orderStatus: { contains: "packed", mode: "insensitive" } },
+      { orderStatus: { contains: "ready_to_ship", mode: "insensitive" } },
+    ] });
+  } else if (filters.statusGroup === "unpaid") {
+    where.statusGroup = "unpaid";
+    and.push({ NOT: { orderStatus: { contains: "pending", mode: "insensitive" } } });
+  } else if (filters.statusGroup) {
+    where.statusGroup = filters.statusGroup;
+  }
+
+  if (filters.orderStatus) {
+    switch (filters.orderStatus) {
+      case "to_pack":
+        where.statusGroup = "unpaid";
+        and.push({ orderStatus: { contains: "pending", mode: "insensitive" } });
+        break;
+      case "to_arrange":
+        where.statusGroup = "to_ship";
+        and.push({ orderStatus: { contains: "packed", mode: "insensitive" } });
+        break;
+      case "to_handover":
+        and.push({ orderStatus: { contains: "ready_to_ship", mode: "insensitive" } });
+        break;
+      default:
+        and.push({ orderStatus: { contains: filters.orderStatus, mode: "insensitive" } });
+    }
+  }
+
   if (filters.from || filters.to) {
     where.orderCreatedAt = {
       ...(filters.from ? { gte: filters.from } : {}),
@@ -593,13 +623,14 @@ function orderWhere(filters: z.infer<typeof orderListFilters>, userId: string): 
     };
   }
   if (filters.search) {
-    where.OR = [
+    and.push({ OR: [
       { darazOrderId: { contains: filters.search, mode: "insensitive" } },
       { customerName: { contains: filters.search, mode: "insensitive" } },
       { trackingNumber: { contains: filters.search, mode: "insensitive" } },
       { orderStatus: { contains: filters.search, mode: "insensitive" } },
-    ];
+    ] });
   }
+  if (and.length) where.AND = and;
   return where;
 }
 api.get("/orders", async (req, res) => {
@@ -639,31 +670,36 @@ api.get("/orders/summary", async (req, res) => {
   // Lane counts are only useful once a store is selected; skip the aggregate entirely for "All stores"
   // so the page does not scan the whole order table on every load.
   if (!filters.storeId) return res.json({ groups: {} });
-  const where = orderWhere({ ...filters, statusGroup: undefined }, req.auth!.id);
-  const [groups, toShipRows] = await Promise.all([
-    db.storeOrder.groupBy({
-      by: ["statusGroup"],
-      where: { ...where, statusGroup: { in: ["unpaid", "to_ship", "shipping"] } },
-      _count: { _all: true },
-    }),
-    db.storeOrder.groupBy({
-      by: ["orderStatus"],
-      where: { ...where, statusGroup: "to_ship" },
-      _count: { _all: true },
-    }),
-  ]);
-  const counts: Record<string, number> = { unpaid: 0, to_ship: 0, shipping: 0 };
-  for (const row of groups) {
-    if (row.statusGroup && row.statusGroup in counts) counts[row.statusGroup] += row._count._all;
-  }
-  // Daraz's To Ship lane splits into Pending, Ready to Ship and Packed.
-  const toShip: Record<string, number> = { pending: 0, ready_to_ship: 0, packed: 0 };
-  for (const row of toShipRows) {
+  const where = orderWhere({ ...filters, statusGroup: undefined, orderStatus: undefined }, req.auth!.id);
+  const rows = await db.storeOrder.groupBy({
+    by: ["statusGroup", "orderStatus"],
+    where,
+    _count: { _all: true },
+  });
+  let unpaid = 0;
+  let toPack = 0;
+  let toArrange = 0;
+  let toHandover = 0;
+  let shipping = 0;
+  for (const row of rows) {
+    if (row.statusGroup === "canceled") continue;
     const raw = (row.orderStatus ?? "").toLowerCase();
-    const key = raw.includes("pending") ? "pending" : raw.includes("ready_to_ship") ? "ready_to_ship" : raw.includes("packed") ? "packed" : null;
-    if (key) toShip[key] += row._count._all;
+    const count = row._count._all;
+    if (row.statusGroup === "unpaid") {
+      if (raw.includes("pending")) toPack += count;
+      else unpaid += count;
+    } else if (row.statusGroup === "to_ship") {
+      if (raw.includes("packed")) toArrange += count;
+      else if (raw.includes("ready_to_ship")) toHandover += count;
+    } else if (raw.includes("ready_to_ship")) {
+      toHandover += count;
+    }
+    if (row.statusGroup === "shipping") shipping += count;
   }
-  return res.json({ groups: counts, toShip });
+  return res.json({
+    groups: { unpaid, to_ship: toPack + toArrange + toHandover, shipping },
+    toShip: { to_pack: toPack, to_arrange: toArrange, to_handover: toHandover },
+  });
 });
 api.get("/orders/export", rateLimit(10, 60000), async (req, res) => {
   const parsed = orderListFilters.safeParse(req.query);
