@@ -1,0 +1,40 @@
+name: Deploy to server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Set the repository variable DEPLOY_ENABLED=true only after the SSH secrets are configured.
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull and deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script_stop: true
+          envs: APP_DIR,BRANCH,PM2_APP,SERVICE,PORT,RELOAD_NGINX,DEPLOY_MODE
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            bash scripts/deploy.sh --skip-git
+        env:
+          APP_DIR: ${{ vars.APP_DIR }}
+          BRANCH: ${{ vars.BRANCH || 'main' }}
+          PM2_APP: ${{ vars.PM2_APP || 'daraz-hub' }}
+          SERVICE: ${{ vars.SERVICE }}
+          PORT: ${{ vars.PORT || '4000' }}
+          RELOAD_NGINX: ${{ vars.RELOAD_NGINX || '0' }}
+          DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}

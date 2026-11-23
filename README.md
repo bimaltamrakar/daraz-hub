@@ -360,6 +360,57 @@ docker compose down
 
 There is no local database volume in this Compose project; the configured PostgreSQL instance remains external.
 
+### Automatic deploys from GitHub
+
+The repository includes [`scripts/deploy.sh`](./scripts/deploy.sh) and a GitHub Actions workflow ([`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml)) that deploys on every push to `main`. The workflow is inert until the repository variable **`DEPLOY_ENABLED=true`** is set (so it does not fail before the server is configured).
+
+First-time server setup (PM2):
+
+```sh
+sudo mkdir -p /var/www && sudo chown "$USER" /var/www
+git clone https://github.com/bimaltamrakar/daraz-hub.git /var/www/daraz-hub
+cd /var/www/daraz-hub
+cp .env.example .env && nano .env
+npm ci --include=dev
+npx prisma generate
+npx prisma migrate deploy
+npm run build
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 startup
+```
+
+Docker alternative: `DEPLOY_MODE=docker` and bring it up once with `docker compose up -d --build`; the deploy script then rebuilds it on each push (the image runs migrations at startup).
+
+Allow GitHub to SSH in with a dedicated key:
+
+```sh
+ssh-keygen -t ed25519 -C github-deploy -f ~/.ssh/github_deploy
+cat ~/.ssh/github_deploy.pub >> ~/.ssh/authorized_keys
+cat ~/.ssh/github_deploy   # paste as the SSH_PRIVATE_KEY secret
+```
+
+Configure **GitHub → Settings → Secrets and variables → Actions**:
+
+| Name | Type | Value |
+|---|---|---|
+| `SSH_HOST` | Secret | Server hostname/IP |
+| `SSH_USER` | Secret | SSH user (ideally a deploy user) |
+| `SSH_PRIVATE_KEY` | Secret | Private key generated above |
+| `SSH_PORT` | Secret (optional) | SSH port, default `22` |
+| `DEPLOY_ENABLED` | Variable | `true` to enable the workflow |
+| `APP_DIR` | Variable | Repo path on the server, e.g. `/var/www/daraz-hub` |
+| `BRANCH` | Variable (optional) | `main` |
+| `PM2_APP` | Variable (optional) | `daraz-hub` |
+| `SERVICE` | Variable (optional) | systemd service name instead of PM2 |
+| `DEPLOY_MODE` | Variable (optional) | `pm2`, `systemd` or `docker`; blank auto-detects |
+| `PORT` | Variable (optional) | Health-check port, default `4000` |
+| `RELOAD_NGINX` | Variable (optional) | `1` to run `nginx -t && systemctl reload nginx` |
+
+Each deploy pulls `origin/main`, installs with `npm ci --include=dev`, runs `prisma generate` + `prisma migrate deploy`, builds API/web, reloads the process (PM2/systemd or Docker Compose), optionally reloads nginx, then health-checks `/api/openapi.json`. Manual runs: `cd /var/www/daraz-hub && bash scripts/deploy.sh` (append `--skip-git` after pulling yourself). Keep **one** server instance running the sync workers against the database, and back up the database before applying migrations.
+
+
+
 ## Security and operations
 
 - Passwords are stored as bcrypt hashes. Access JWTs are held in browser memory; refresh credentials are held in an HttpOnly cookie and represented in the database by a SHA-256 hash.
