@@ -582,8 +582,9 @@ function orderWhere(filters: z.infer<typeof orderListFilters>, userId: string): 
   const where: Prisma.StoreOrderWhereInput = {
     store: { userId, isActive: true, ...(filters.storeId ? { id: filters.storeId } : {}) },
   };
-  // Canceled orders are kept for the Cancellation lane but are never part of the default queue or totals.
-  where.statusGroup = filters.statusGroup ? filters.statusGroup : { not: "canceled" };
+  // "All" includes every status (including canceled); a specific lane filters to that status.
+  // Canceled orders stay out of dashboard metrics/reports.
+  if (filters.statusGroup) where.statusGroup = filters.statusGroup;
   if (filters.orderStatus) where.orderStatus = { contains: filters.orderStatus, mode: "insensitive" };
   if (filters.from || filters.to) {
     where.orderCreatedAt = {
