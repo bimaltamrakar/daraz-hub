@@ -26,10 +26,15 @@ The application is multi-user: each user sees and manages their own stores. Dara
 - Seeded administrator account with a required first-login password change.
 - Store creation, removal, Daraz OAuth connection, and manual token refresh.
 - Seller identity and profile retrieval, including a retry action when profile retrieval fails.
-- Scheduled and manual order sync with per-store start date and frequency settings.
-- Paginated orders page with store, status, date, and text filters plus sortable columns.
-- Product master populated from the Daraz seller catalog and order items.
-- Complete raw JSON payload retention for each Daraz order-detail and product-detail response.
+- Per-store settings page: order-sync start date, frequency, sync-now, backfill state, counts, and last error.
+- Per-store **Active/Inactive** switch. Inactive stores, and their orders/products, are hidden from every list, report, dashboard count and sync worker until reactivated; **Show inactive** on My stores reveals them for management.
+- Daraz-style order management across all stores: status lanes (Unpaid, To Ship, Shipping, Delivered, Failed Delivery, Cancellation, Return or Refund). **To Ship has Pending / Ready to Ship / Packed sub-lanes**, and lane counts are only computed for Unpaid, To Ship and Shipping after a store is selected. **Canceled orders are excluded from the default queue, totals, exports and every dashboard metric**; they remain viewable only in the Cancellation lane.
+- Official AWB printing with separate fulfilment actions: **Print AWB** fetches Daraz's shipping-label PDF; **Create package** calls Daraz's pack API to assign a tracking number when none exists; **Mark RTS** separately marks the packages ready to ship. No action runs automatically. **Choice seller stores are orders-only**: their orders and full details are synced for billing, with no package, RTS or AWB actions.
+- Fast order sync from Daraz list responses plus on-demand order detail/item enrichment, with resumable backfill for very large stores.
+- Store-wise product catalog with variants (colour/size), image URLs, price, offer price, and stock; includes a Products page with thumbnails, filters, and a variant drawer.
+- Live analytics dashboard: net sales, order-lane counts, SKU totals, sales trend line chart, per-store sales bar comparison, sync health, and recent activity.
+- Catalog sync for normal sellers via `GET /products/get` + `/product/item/get`; Choice sellers skip the products API (Daraz forbids it) and have SKUs created from order line items instead.
+- New/active order items are synced into the catalog automatically, so SKUs from incoming orders exist even before a catalog sync runs.
 - Store status and access/refresh token expiry metadata.
 - Administrator views for users, stores, individual store details, and the latest 250 audit events.
 - OpenAPI YAML document and a runtime JSON endpoint index.
@@ -160,7 +165,8 @@ The Prisma schema defines these models:
 | `Store` | Marketplace, owner, seller identity/profile details, connection status, and timestamps. |
 | `StoreToken` | AES-256-GCM ciphertext for access and refresh tokens, expiry dates, and the latest refresh error. |
 | `StoreOrder` | Normalized, searchable order fields and the complete JSON response from Daraz's order-detail endpoint. |
-| `ProductMaster` | Per-store product identity and searchable fields plus the complete JSON response from Daraz's product-detail endpoint. |
+| `ProductMaster` | Per-store product identity, name, brand, image URL, price, offer price, stock, variation, and the complete JSON response from Daraz's product-detail endpoint. |
+| `ProductVariant` | Per-store SKU variants with colour, size, price, offer price, stock, status, image URL, and raw SKU JSON. |
 | Store sync fields | Per-store start date, frequency, last/next sync, product catalog cursor, lock lease, and sanitized error. |
 | `OAuthState` | Single-use, expiring OAuth state associated with the initiating user and store. |
 | `AuditLog` | Administrative and store activity records. |
@@ -200,7 +206,9 @@ The client currently offers `NP`, `PK`, `BD`, `LK`, and `MM` in the region selec
 
 Daraz REST calls use Lazop signing: request parameters are sorted by key, concatenated with the API path, and signed with HMAC-SHA256 using the application secret. Token exchange, refresh, and seller-profile requests have a 15-second timeout. The authorization code expires after 30 minutes.
 
-Order sync uses the signed `GET /orders/get` list endpoint followed by `GET /order/get` for each order. Every order-list request includes Daraz's case-sensitive `CreatedAfter` parameter, together with `limit`, `offset`, and `sort_by`. The initial cursor is the configured sync start date; after a successful order-list pass, the greatest `created_at` timestamp in its responses is saved as the cursor and reused for the next run. Changing the configured start date resets this cursor. Product master sync pages through `GET /products/get` with `filter=all` and a page limit of 50, then requests `GET /product/item/get` for catalog products and products referenced by changed orders. Product catalog updates use `update_after` with a one-minute overlap. Confirm that the Daraz application has order and product read permissions enabled for each marketplace.
+Order sync pages through the signed `GET /orders/get` list endpoint and stores each order summary (status, customer, amount, item count) without a detail request per order. Daraz's gateway only recognises the snake_case parameters `created_after`/`created_before` and `update_after` (camelCase variants are ignored and rejected with error `E018`), together with `limit`, `offset`, and `sort_by`. The first pass for a store is a resumable backfill that walks **one-day windows** (`created_after` + `created_before`) because Daraz caps `offset` at 5,000 rows per query — a single wide scan silently truncates busy stores. It advances a saved window cursor and is capped at 10,000 fetched rows per pass; later passes ask for orders updated since the stored cursor minus a one-minute overlap, so status changes on existing orders are picked up. The update cursor is the greatest `updated_at` timestamp seen; changing the configured start date resets both cursors and restarts the backfill. Full order detail and line items are fetched lazily by `GET /api/orders/:id` and cached in `rawDetails`.
+
+Product catalog sync is a **standalone pipeline for normal sellers** (Choice sellers cannot use the products API): a worker claims due stores, pages `GET /products/get` (`filter=all`, 50 per page) and requests `GET /product/item/get` for the listings, storing product fields and every SKU as a `ProductVariant`. Initial full syncs are resumable via a saved offset (150 products per pass, then it continues automatically); later passes use `update_after` with a one-minute overlap. Syncs are scheduled from the store's order frequency and can be queued with **Sync products** on the Products page or Store settings. New/active order line items are still upserted into the catalog separately, so incoming-order SKUs exist even for Choice stores. Product-catalog failures (permission, timeout, rate limit, unexpected shape) are recorded on the store and never block order sync.
 
 OAuth state is single-use and expires according to `OAUTH_STATE_TTL_MINUTES`. It is also bound to the initiating browser using the short-lived, HttpOnly `daraz_oauth_state` cookie. In production, callbacks without the matching browser cookie are rejected. In non-production environments the mismatch is logged instead, to support development setups where the callback tunnel and Vite run on different hosts.
 
@@ -208,10 +216,12 @@ OAuth state is single-use and expires according to `OAUTH_STATE_TTL_MINUTES`. It
 
 ### User workspace
 
-- **Overview (`/`)** — store totals and a summary of connected, expiring-soon, and expired stores; shows up to three recent stores.
+- **Overview (`/`)** — live analytics dashboard with a **store selector** (All stores or one store) and global date range (7/14/30/90 days). KPIs: net sales, orders, AOV, units/order, SKUs — each with previous-period deltas. Includes orders-by-status counts, per-store sales trend, sales-by-store bars with share, top products by revenue/units, category performance, cancellations & returns trend, stock alerts (out-of-stock/low-stock/no-sales), a weekday × hour sales heatmap, a ranked store leaderboard (share, change, sync health), and **CSV export** of the selected range. Auto-refreshes every 30s with a Live toggle.
 - **My stores (`/stores`)** — add, list, connect, refresh, and remove your stores.
 - **Store details (`/stores/:id`)** — inspect seller profile, token expiry, errors, and recent activity; retry seller-profile retrieval; connect, refresh, or remove the store; configure order sync start date and frequency; view sync status; and queue a manual sync.
-- **Orders (`/orders`)** — browse your synced orders with store, text, order status, delivery status, and created-date filters; sortable columns and server-side pagination.
+- **Store settings (`/stores/:id/settings`)** — per-store order-sync schedule (start date and frequency), seller type (normal or Choice), manual sync, initial-backfill progress, synced order/product counts, and the last sync error.
+- **Order management (`/orders`)** — every connected store in one queue with Seller Center-style status lanes. Counts appear only for Unpaid, To Ship and Shipping, and only after selecting a store; To Ship expands into **Pending / Ready to Ship / Packed** sub-lanes. Canceled orders are excluded from the default queue, totals and exports (use the Cancellation lane to inspect them). Filter by store, order/customer/tracking text, or created-date range; sort, page, and export CSV. Selecting an order opens a drawer with line items, SKU, quantity, amount, delivery/tracking, customer and shipping address, plus a refresh action that loads the latest detail from Daraz.
+- **Products (`/products`)** — store-wise catalog with image thumbnails, price, offer price, stock, status, and variant counts. Select a product to see its variants (SKU, colour/size, price, offer, stock, image). New-order SKUs are added automatically; Choice stores show order-derived products only. **Sync products** refreshes incrementally; **Full resync** clears the catalog cursor/offset and re-fetches everything from the start.
 - **Account** — sign up or sign in, change the password, and sign out.
 
 Store status is computed from saved status and token expiry:
@@ -226,7 +236,7 @@ Store status is computed from saved status and token expiry:
 
 Order and product sync runs in the application process every 15 seconds for stores that are due. Sync frequency is configurable per store: manual, every 15 minutes, hourly, every six hours, or daily. A database lease prevents two application processes from syncing the same store at once. The initial sync starts at the configured date; later order fetches use an overlapping update-time cursor, and product catalog fetches use an overlapping product-update cursor. The overlap makes retries safe; records are upserted by store plus Daraz order/item ID.
 
-For each order returned by Daraz's order-list endpoint, the sync fetches order details and stores the full JSON response in `StoreOrder.rawDetails`, along with normalized fields used by the Orders list. It pages through the store's seller product catalog and fetches product details for catalog items and order line items; each full JSON response is stored in `ProductMaster.rawDetails`. Product master records are scoped to a store, since seller listing data and inventory are marketplace/store-specific. Raw payloads can contain customer or seller data and are only returned by the owner-scoped order/product detail API.
+For each order returned by Daraz's order-list endpoint, the sync stores the summary JSON in `StoreOrder.rawDetails` along with normalized fields and a status lane. Opening an order replaces that payload with the merged `/order/get` + `/order/items/get` response, so line items, tracking, and shipping address are available without making the backfill pay for a detail call per order. Product master records are scoped to a store, since seller listing data and inventory are marketplace/store-specific. Raw payloads can contain customer or seller data and are only returned by the owner-scoped order/product detail API.
 
 If the access token expires, the worker attempts to refresh it with the stored refresh token before syncing. Failures are sanitized and displayed in the store's order-sync status; automatic retry follows the selected schedule. For a manual-only schedule, use **Sync now** to retry.
 
@@ -264,7 +274,9 @@ Sign-up is limited to five requests per IP per hour; login to eight per IP per 1
 | Method and path | Request | Success |
 | --- | --- | --- |
 | `GET /api/dashboard` | No body | `200`; `{ "total": 0, "connected": 0, "expiringSoon": 0, "expired": 0 }` (counts vary with the user's stores). |
-| `GET /api/stores` | No body | `200`; current user's stores, with token values omitted. |
+| `GET /api/dashboard/stats` | Query: `days` (7–90, default 14) and optional `storeId`. | `200`; period-scoped KPIs (sales, orders, AOV, units, previous-period comparison), status counts/trend, per-store trend and leaderboard data (share, rank, deltas, sync health), top products and categories from cached order line items, stock alerts, weekday/hour heatmap, and recent activity. |
+| `GET /api/dashboard/export` | Query: `days`, optional `storeId`. | `200`; CSV report with KPIs, status counts, store leaderboard, top products, categories and stock alerts. |
+| `GET /api/stores` | Optional `includeInactive=1`. | `200`; current user's stores (inactive ones are omitted by default), with token values omitted. |
 | `POST /api/stores` | `{ "label": "Kathmandu Outlet", "country": "NP" }` | `201`; creates a pending store. Label is required (1–100 characters); country is a two-letter code and is normalized to uppercase. |
 | `GET /api/stores/:id` | No body | `200`; owned store details and up to 20 recent activity entries; `404` if absent or not owned by the user. |
 | `GET /api/stores/:id/tokens` | No body | `200`; returns plaintext credentials only after an explicit request by the store owner. Rate-limited and non-cacheable. |
@@ -273,16 +285,25 @@ Sign-up is limited to five requests per IP per hour; login to eight per IP per 1
 | `POST /api/stores/:id/refresh` | No body | `200`; updated token expiry metadata only. Returns `404` if not found, `409` if a usable refresh token is unavailable, or `502` if Daraz rejects/fails the refresh. |
 | `POST /api/stores/:id/profile` | No body | `200`; updated store profile. Returns `404` if not found, `409` if there is no valid access token, or `502` if Daraz profile retrieval fails. |
 | `PATCH /api/stores/:id/order-sync-settings` | `{ "fromDate": "2026-01-01", "frequency": "hourly" }` | `200`; updated store sync settings. Frequencies: `manual`, `every_15_minutes`, `hourly`, `every_6_hours`, `daily`. Dates are UTC calendar dates and cannot be in the future. |
+| `PATCH /api/stores/:id/type` | `{ "storeType": "normal" }` or `{ "storeType": "choice" }` | `200`; updated store. Choice stores are fulfilled by Daraz and cannot print AWBs or be marked ready to ship from this app. |
+| `PATCH /api/stores/:id/active` | `{ "isActive": false }` or `{ "isActive": true }` | `200`; updated store. Deactivating clears sync schedules and hides the store and its orders/products from lists, dashboard and reports; reactivating restores them. |
 | `POST /api/stores/:id/orders/sync` | No body | `202`; queues an order and product sync. Returns `409` if the store is not connected or a sync is already running. |
+| `POST /api/stores/:id/products/sync` | No body | `202`; queues the product catalog sync for a normal seller. `409` for Choice sellers (products API not allowed), unconnected stores, or an already-running sync. |
+| `POST /api/stores/:id/products/resync` | No body | `202`; clears the catalog cursor/offset and queues a full catalog re-fetch from the beginning. `409` for Choice sellers or a running sync. |
 
 ### Orders and product master
 
 | Method and path | Request | Success |
 | --- | --- | --- |
-| `GET /api/orders` | Query: `page`, `pageSize` (max 100), `storeId`, `search`, `orderStatus`, `deliveryStatus`, `from`, `to`, `sortBy`, `sortOrder`. | `200`; `{ orders, page, pageSize, total, totalPages }`. Search matches order ID, customer name, and tracking number. Sorting uses an allowlisted normalized field. All rows are restricted to the signed-in user's stores. |
-| `GET /api/orders/:id` | No body | `200`; normalized fields and complete Daraz order-detail JSON in `rawDetails`. |
-| `GET /api/products` | Query: `page`, `pageSize` (max 100), `storeId`, `search`. | `200`; paginated product master fields, scoped to the signed-in user's stores. Search matches Daraz item ID, seller SKU, and product name. |
-| `GET /api/products/:id` | No body | `200`; product master record including the complete Daraz product-detail response in `rawDetails`. |
+| `GET /api/orders` | Query: `page`, `pageSize` (max 100), `storeId`, `search`, `statusGroup` (`unpaid`, `to_ship`, `shipping`, `delivered`, `failed_delivery`, `canceled`, `returned`), `orderStatus`, `deliveryStatus`, `from`, `to`, `sortBy`, `sortOrder`. | `200`; `{ orders, page, pageSize, total, totalPages }`. Search matches order ID, customer name, and tracking number. Sorting uses an allowlisted normalized field. All rows are restricted to the signed-in user's stores. |
+| `GET /api/orders/summary` | `storeId` (required for counts), plus search/date filters. | `200`; `{ groups: { unpaid, to_ship, shipping }, toShip: { pending, ready_to_ship, packed } }`; empty groups when no store is selected. |
+| `GET /api/orders/export` | Same filters as `/api/orders`. | `200`; CSV of all matching orders (canceled excluded unless `statusGroup=canceled`). |
+| `GET /api/orders/:id` | Optional `refresh=1`. | `200`; normalized fields plus the Daraz order detail and line items in `rawDetails`. The first view fetches `/order/get` and `/order/items/get` from Daraz and caches the merged payload; later views are served from the database. |
+| `GET /api/orders/:id/awb` | No body | `200`; `{ source: "daraz", pdfUrl, packages, trackingNumber }` with Daraz's official AWB PDF URL. `409` when the order has no package/tracking yet; `409` with Daraz's reason for warehouse-fulfilled orders. |
+| `POST /api/orders/:id/package` | No body | Creates the fulfillment package(s) for an unpacked order via Daraz's pack API (`/order/fulfill/pack`), returning `{ created, packages, data }`. Returns `created: false` when a package already exists. |
+| `POST /api/orders/:id/rts` | No body | Marks the order's packages ready to ship via `/order/package/rts`, records an audit event, and returns `{ marked: true, packages }`. `409` when no package exists. |
+| `GET /api/products` | Query: `page`, `pageSize` (max 100), `storeId`, `search`. | `200`; paginated products with image URL, price, offer price, stock, brand, source (`catalog`/`order`), and variant count. Search matches item ID, seller SKU, product name, or variant SKU. |
+| `GET /api/products/:id` | No body | `200`; product record with `variants` (SKU, colour, size, price, offer price, stock, status, image URL) and the raw product payload in `rawDetails`. |
 
 Raw details are the complete JSON response body received from Daraz's detail endpoint (including its response envelope), not a whitelist of selected properties. Daraz list endpoint response bodies are used for pagination and cursors; detail endpoint payloads are retained in JSONB.
 

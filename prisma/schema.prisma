@@ -13,6 +13,11 @@ enum Role {
   user
 }
 
+enum StoreType {
+  normal
+  choice
+}
+
 enum StoreStatus {
   pending
   connected
@@ -60,6 +65,10 @@ model Store {
   userId             String
   label              String
   country            String
+  // Inactive stores stay configured but are hidden from lists, reports and syncs.
+  isActive           Boolean            @default(true)
+  // Normal sellers print their own AWBs; Choice sellers are fulfilled by Daraz.
+  storeType          StoreType          @default(normal)
   sellerId           String?
   status             StoreStatus        @default(pending)
   // Seller identity captured from the Daraz token response at authorization time.
@@ -82,8 +91,16 @@ model Store {
   orderSyncFrom      DateTime           @default(now())
   orderSyncFrequency OrderSyncFrequency @default(hourly)
   orderSyncCursor    DateTime?
+  // Resumable initial backfill: when null and orderBackfillDone is false, sync starts at orderSyncFrom.
+  orderBackfillCursor DateTime?
+  orderBackfillDone   Boolean           @default(false)
   orderSyncLastAt    DateTime?
   productSyncLastAt  DateTime?
+  productSyncNextAt  DateTime?
+  productSyncOffset  Int                @default(0)
+  productSyncLockId  String?
+  productSyncLockUntil DateTime?
+  productSyncError   String?
   orderSyncNextAt    DateTime?
   orderSyncLockId    String?
   orderSyncLockUntil DateTime?
@@ -96,6 +113,7 @@ model Store {
   auditLogs          AuditLog[]
   orders             StoreOrder[]
   products           ProductMaster[]
+  variants           ProductVariant[]
 
   @@index([userId])
   @@index([orderSyncNextAt])
@@ -111,31 +129,70 @@ model StoreOrder {
   orderStatus    String?
   deliveryStatus String?
   trackingNumber String?
+  // Normalized group used by the Order Management tabs: unpaid, to_ship, shipping,
+  // delivered, failed_delivery, canceled, returned.
+  statusGroup    String?
+  amount         Decimal?  @db.Decimal(14, 2)
+  itemCount      Int?
   rawDetails     Json
+  itemsSyncedAt  DateTime?
   syncedAt       DateTime  @default(now())
   store          Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
 
   @@unique([storeId, darazOrderId])
   @@index([storeId, orderCreatedAt])
   @@index([storeId, orderUpdatedAt])
+  @@index([storeId, statusGroup])
   @@index([orderStatus])
   @@index([deliveryStatus])
 }
 
 model ProductMaster {
-  id          String   @id @default(cuid())
-  storeId     String
-  darazItemId String
-  sellerSku   String?
-  name        String?
-  status      String?
-  rawDetails  Json
-  fetchedAt   DateTime @default(now())
-  store       Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  id           String   @id @default(cuid())
+  storeId      String
+  darazItemId  String
+  sellerSku    String?
+  name         String?
+  brand        String?
+  status       String?
+  imageUrl     String?
+  price        Decimal? @db.Decimal(14, 2)
+  specialPrice Decimal? @db.Decimal(14, 2)
+  quantity     Int?
+  variation    Json?
+  // "catalog" for products fetched from Daraz, "order" for SKUs discovered in an order.
+  syncedFrom   String?  @default("catalog")
+  rawDetails   Json
+  fetchedAt    DateTime @default(now())
+  store        Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  variants     ProductVariant[]
 
   @@unique([storeId, darazItemId])
   @@index([storeId, sellerSku])
   @@index([storeId, name])
+}
+
+model ProductVariant {
+  id           String   @id @default(cuid())
+  storeId      String
+  productId    String
+  sku          String
+  darazSkuId   String?
+  name         String?
+  color        String?
+  size         String?
+  price        Decimal? @db.Decimal(14, 2)
+  specialPrice Decimal? @db.Decimal(14, 2)
+  quantity     Int?
+  status       String?
+  imageUrl     String?
+  rawDetails   Json?
+  updatedAt    DateTime @updatedAt
+  store        Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  product      ProductMaster @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, sku])
+  @@index([productId])
 }
 
 model StoreToken {

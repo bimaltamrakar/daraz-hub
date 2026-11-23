@@ -37,6 +37,9 @@ describe("Daraz order response mapping", () => {
       orderStatus: "pending",
       deliveryStatus: "ready_to_ship",
       trackingNumber: "TRACK-123",
+      statusGroup: "unpaid",
+      amount: null,
+      itemCount: null,
     });
     expect(productItemIds(detail)).toEqual(["456"]);
   });
@@ -59,9 +62,23 @@ describe("Daraz order response mapping", () => {
     expect(order.orderStatus).toBe("pending, ready_to_ship");
     expect(order.deliveryStatus).toBe("packed");
     expect(order.trackingNumber).toBe("TRACK-A, TRACK-B");
+    expect(order.statusGroup).toBe("to_ship");
   });
 
-  it("extracts the created timestamp used as the next CreatedAfter cursor", () => {
+  it("maps Daraz status arrays onto order-management tabs", () => {
+    const group = (statuses: string[]) => normalizeOrder({ order_id: "1", created_at: "2026-10-20T10:00:00Z", statuses }).statusGroup;
+    expect(group(["pending"])).toBe("unpaid");
+    expect(group(["pending", "ready_to_ship"])).toBe("to_ship");
+    expect(group(["packed"])).toBe("to_ship");
+    expect(group(["shipped"])).toBe("shipping");
+    expect(group(["delivered"])).toBe("delivered");
+    expect(group(["canceled"])).toBe("canceled");
+    expect(group(["returned"])).toBe("returned");
+    expect(group(["failed_delivery"])).toBe("failed_delivery");
+    expect(group(["shipped_back"])).toBe("returned");
+  });
+
+  it("extracts the created timestamp used as the backfill cursor", () => {
     expect(orderCreatedAt({ created_at: "2026-10-21T08:45:12Z" })).toEqual(new Date("2026-10-21T08:45:12Z"));
     expect(() => orderCreatedAt({ created_at: "not-a-date" })).toThrow("invalid created_at");
   });
@@ -81,7 +98,8 @@ describe("Daraz product response mapping", () => {
   });
 
   it("rejects unexpected product response shapes", () => {
-    expect(() => productRecords({ data: {} })).toThrow("unexpected response");
+    expect(productRecords({ data: {} })).toEqual([]);
+    expect(() => productRecords({ data: { something: [] } })).toThrow("unexpected response");
     expect(() => productDetailRecord({ data: {} })).toThrow("unexpected response");
   });
 });

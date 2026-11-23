@@ -224,14 +224,24 @@ export function refreshDarazToken(country: string, refreshToken: string) {
 export function fetchDarazOrders(
   country: string,
   accessToken: string,
-  options: { createdAfter: string; limit: number; offset: number },
+  options: { createdAfter?: string; createdBefore?: string; updatedAfter?: string; limit: number; offset: number },
 ) {
+  // Daraz's gateway only recognises the snake_case names: `created_after` and `update_after`.
+  // CamelCase variants (CreatedAfter / UpdatedAfter) are ignored and rejected with
+  // E018 "Either CreatedAfter or UpdatedAfter is mandatory".
+  const range: Record<string, string> = options.updatedAfter
+    ? { update_after: options.updatedAfter }
+    : options.createdAfter
+      ? { created_after: options.createdAfter, ...(options.createdBefore ? { created_before: options.createdBefore } : {}) }
+      : {};
+  if (!Object.keys(range).length) throw new Error("Order sync requires createdAfter or updatedAfter.");
   return callDaraz(country, "/orders/get", "GET", {
     access_token: accessToken,
-    CreatedAfter: options.createdAfter,
+    ...range,
     limit: String(options.limit),
     offset: String(options.offset),
-    sort_by: "updated_at",
+    sort_by: options.createdBefore ? "created_at" : "updated_at",
+    ...(options.createdBefore ? { sort_direction: "asc" } : {}),
   }, [accessToken]);
 }
 
@@ -239,19 +249,85 @@ export function fetchDarazOrderDetails(country: string, accessToken: string, ord
   return callDaraz(country, "/order/get", "GET", { access_token: accessToken, order_id: orderId }, [accessToken]);
 }
 
+export function fetchDarazOrderItems(country: string, accessToken: string, orderId: string) {
+  return callDaraz(country, "/order/items/get", "GET", { access_token: accessToken, order_id: orderId }, [accessToken]);
+}
+
+/**
+ * Order documents (shipping label / invoice / carrier manifest). Daraz returns the document as a
+ * base64 payload in `data.document.file`, and not every marketplace/seller is allowed to fetch
+ * each document type, so callers must handle an empty file or an E020 rejection.
+ */
+export function fetchDarazOrderDocument(
+  country: string,
+  accessToken: string,
+  orderItemIds: string,
+  docType: "shippingLabel" | "invoice" | "carrierManifest",
+) {
+  return callDaraz(country, "/order/document/get", "GET", {
+    access_token: accessToken,
+    doc_type: docType,
+    order_item_ids: orderItemIds,
+  }, [accessToken]);
+}
+
+/**
+ * Official shipping-label (AWB) PDF for packed packages. Only seller-fulfilled (dropship) orders
+ * are eligible; warehouse-fulfilled orders are rejected by Daraz with error_code 30017.
+ */
+export function fetchPackageAwbDocuments(country: string, accessToken: string, packageIds: string[]) {
+  return callDaraz(country, "/order/package/document/get", "POST", {
+    access_token: accessToken,
+    getDocumentReq: JSON.stringify({
+      packages: packageIds.map((packageId) => ({ package_id: packageId })),
+      doc_type: "PDF",
+    }),
+  }, [accessToken]);
+}
+
+/** Marks packed packages ready to ship so Daraz assigns/prints the AWB. */
+export function markPackagesReadyToShip(country: string, accessToken: string, packageIds: string[]) {
+  return callDaraz(country, "/order/package/rts", "POST", {
+    access_token: accessToken,
+    readyToShipReq: JSON.stringify({
+      packages: packageIds.map((packageId) => ({ package_id: packageId })),
+    }),
+  }, [accessToken]);
+}
+
+/** Creates the fulfillment package(s) for a paid order; Daraz returns the tracking number. */
+export function createOrderPackages(country: string, accessToken: string, orderId: string, orderItemIds: string[]) {
+  return callDaraz(country, "/order/fulfill/pack", "POST", {
+    access_token: accessToken,
+    packReq: JSON.stringify({
+      shipping_allocate_type: "TFS",
+      delivery_type: "dropship",
+      pack_order_list: [{ order_id: orderId, order_item_list: orderItemIds }],
+    }),
+  }, [accessToken]);
+}
+
 export function fetchDarazProductDetails(country: string, accessToken: string, itemId: string) {
   return callDaraz(country, "/product/item/get", "GET", { access_token: accessToken, item_id: itemId }, [accessToken]);
+}
+
+/**
+ * Daraz's product APIs accept ISO 8601 only with a numeric UTC offset and no milliseconds;
+ * values such as `...T17:37:33.043Z` are rejected with E017 "Invalid Date Format".
+ */
+export function darazDateTime(value: Date) {
+  return `${value.toISOString().slice(0, 19)}+00:00`;
 }
 
 export function fetchDarazProducts(
   country: string,
   accessToken: string,
-  options: { updatedAfter?: string; limit: number; offset: number },
+  options: { updatedAfter?: Date; limit: number; offset: number },
 ) {
   return callDaraz(country, "/products/get", "GET", {
     access_token: accessToken,
     filter: "all",
-    ...(options.updatedAfter ? { update_after: options.updatedAfter } : {}),
+    ...(options.updatedAfter ? { update_after: darazDateTime(options.updatedAfter) } : {}),
     limit: String(options.limit),
     offset: String(options.offset),
   }, [accessToken]);

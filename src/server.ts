@@ -7,19 +7,31 @@ import jwt from "jsonwebtoken";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
-import { OrderSyncFrequency, type Prisma, type StoreToken } from "@prisma/client";
+import { OrderSyncFrequency, Prisma, StoreType, type StoreToken } from "@prisma/client";
 import { db } from "./lib/db";
 import { config } from "./lib/config";
 import { audit } from "./lib/audit";
 import { decrypt, encrypt, sha256 } from "./lib/crypto";
 import { authenticate, activeUser, requireAdmin } from "./lib/auth";
-import { authorizationUrl, createOAuthState, exchangeAuthorizationCode, fetchSellerProfile, refreshDarazToken, safeDarazErrorMessage, type DarazTokenResponse } from "./lib/daraz";
+import { authorizationUrl, createOAuthState, createOrderPackages, exchangeAuthorizationCode, fetchDarazOrderDetails, fetchDarazOrderItems, fetchPackageAwbDocuments, fetchSellerProfile, markPackagesReadyToShip, refreshDarazToken, safeDarazErrorMessage, type DarazTokenResponse } from "./lib/daraz";
 import { isOAuthStateUsable, isRefreshTokenUsable, ownedStoreFilter } from "./lib/policies";
+import { fetchAccessToken } from "./lib/access-token";
 import { orderSyncFrequencies, queueStoreOrderSync, startOrderSyncWorker } from "./lib/order-sync";
+import { startProductSyncWorker, queueProductSync, upsertProductsFromOrderItems } from "./lib/product-sync";
+import { normalizeOrder, orderDetailRecord } from "./lib/order-data";
+import { buildDashboardStats, dashboardCsv } from "./lib/dashboard";
 
 const app = express();
 app.set("trust proxy", 1);
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      // Product images are served from Daraz CDNs.
+      "img-src": ["'self'", "data:", "https:"],
+    },
+  },
+}));
 app.use(cors({ origin: config.APP_ORIGIN, credentials: true }));
 app.use(express.json({ limit: "32kb" }));
 app.use(cookieParser());
@@ -68,10 +80,14 @@ const defined = <T extends object>(object: T) =>
   Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined)) as { [K in keyof T]?: Exclude<T[K], undefined> };
 /** Store representation returned to the browser: every column except token ciphertext. */
 function publicStore<T extends { tokens: StoreToken | null; status: string }>({ tokens, ...store }: T) {
-  const { orderSyncLockId, orderSyncLockUntil, ...visibleStore } = store as T & { orderSyncLockId?: string | null; orderSyncLockUntil?: Date | null };
+  const { orderSyncLockId, orderSyncLockUntil, productSyncLockId, productSyncLockUntil, ...visibleStore } = store as T & {
+    orderSyncLockId?: string | null; orderSyncLockUntil?: Date | null;
+    productSyncLockId?: string | null; productSyncLockUntil?: Date | null;
+  };
   return {
     ...visibleStore,
     orderSyncRunning: Boolean(orderSyncLockUntil && orderSyncLockUntil > new Date()),
+    productSyncRunning: Boolean(productSyncLockUntil && productSyncLockUntil > new Date()),
     status: displayStoreStatus({ status: store.status, tokens }),
     accessExpiresAt: tokens?.accessExpiresAt ?? null,
     refreshExpiresAt: tokens?.refreshExpiresAt ?? null,
@@ -83,7 +99,7 @@ const storeActivity = { orderBy: { createdAt: "desc" }, take: 20, select: { id: 
 async function saveDarazTokens(storeId: string, tokens: DarazTokenResponse, refreshed: boolean) {
   const syncSettings = refreshed ? null : await db.store.findUniqueOrThrow({
     where: { id: storeId },
-    select: { orderSyncFrequency: true },
+    select: { orderSyncFrequency: true, storeType: true },
   });
   const tokenData = {
     accessTokenEnc: encrypt(tokens.accessToken),
@@ -105,6 +121,7 @@ async function saveDarazTokens(storeId: string, tokens: DarazTokenResponse, refr
         status: "connected",
         ...(refreshed ? {} : { connectedAt: new Date() }),
         ...(!refreshed ? { orderSyncNextAt: syncSettings?.orderSyncFrequency === "manual" ? null : new Date() } : {}),
+        ...(!refreshed && syncSettings?.storeType !== "choice" ? { productSyncNextAt: new Date() } : {}),
         // Seller identity reported by Daraz alongside the token; saved at authorization time.
         ...defined({
           sellerId: tokens.sellerId,
@@ -276,9 +293,15 @@ app.get("/api/openapi.json", (_req, res) => res.json({
     "/stores/{id}/refresh": { post: { summary: "Refresh store token" } },
     "/stores/{id}/profile": { post: { summary: "Re-fetch seller profile from Daraz" } },
     "/stores/{id}/order-sync-settings": { patch: { summary: "Configure order sync" } },
+    "/stores/{id}/type": { patch: { summary: "Set seller type (normal or Choice)" } },
     "/stores/{id}/orders/sync": { post: { summary: "Queue order and product sync" } },
     "/orders": { get: { summary: "Search, filter, sort, and paginate owned orders" } },
-    "/orders/{id}": { get: { summary: "Get an owned order and its full Daraz details" } },
+    "/orders/summary": { get: { summary: "Status-lane and per-store counts for the current filters" } },
+    "/orders/export": { get: { summary: "Export filtered orders as CSV" } },
+    "/orders/{id}": { get: { summary: "Get an owned order with Daraz detail and line items" } },
+    "/orders/{id}/awb": { get: { summary: "Fetch Daraz's official AWB PDF for an order" } },
+    "/orders/{id}/package": { post: { summary: "Create the fulfillment package and tracking number" } },
+    "/orders/{id}/rts": { post: { summary: "Mark the order's packages ready to ship (RTS)" } },
     "/products": { get: { summary: "Search and paginate owned product master" } },
     "/products/{id}": { get: { summary: "Get an owned product and its full Daraz details" } },
     "/admin/users": { get: { summary: "Admin: list users" } },
@@ -291,7 +314,12 @@ const api = express.Router();
 api.use(authenticate, activeUser);
 api.get("/me", async (req, res) => res.json({ user: await db.user.findUniqueOrThrow({ where: { id: req.auth!.id }, select: { id: true, name: true, email: true, role: true, mustChangePassword: true } }) }));
 api.get("/stores", async (req, res) => {
-  const stores = await db.store.findMany({ where: { userId: req.auth!.id }, include: { tokens: true }, orderBy: { createdAt: "desc" } });
+  const includeInactive = req.query.includeInactive === "1";
+  const stores = await db.store.findMany({
+    where: { userId: req.auth!.id, ...(includeInactive ? {} : { isActive: true }) },
+    include: { tokens: true },
+    orderBy: { createdAt: "desc" },
+  });
   return res.json(stores.map(publicStore));
 });
 api.patch("/stores/:id/order-sync-settings", async (req, res) => {
@@ -322,7 +350,7 @@ api.patch("/stores/:id/order-sync-settings", async (req, res) => {
     data: {
       orderSyncFrom: fromDate,
       orderSyncFrequency: parsed.data.frequency,
-      ...(store.orderSyncFrom.getTime() !== fromDate.getTime() ? { orderSyncCursor: null, orderSyncLastAt: null } : {}),
+      ...(store.orderSyncFrom.getTime() !== fromDate.getTime() ? { orderSyncCursor: null, orderSyncLastAt: null, orderBackfillCursor: null, orderBackfillDone: false } : {}),
       orderSyncNextAt: parsed.data.frequency === "manual" ? null : new Date(),
       orderSyncError: null,
     },
@@ -336,12 +364,85 @@ api.post("/stores/:id/orders/sync", rateLimit(5, 60000), async (req, res) => {
   const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true } });
   if (!store) return res.status(404).json({ error: "Store not found." });
   if (!store.tokens) return res.status(409).json({ error: "Connect this store before syncing orders." });
+  if (!store.isActive) return res.status(409).json({ error: "This store is inactive. Activate it in store settings before syncing." });
   if (!(await queueStoreOrderSync(store.id))) return res.status(409).json({ error: "An order sync is already running for this store." });
   return res.status(202).json({ status: "queued", message: "Order and product sync has been queued." });
 });
+api.patch("/stores/:id/active", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const parsed = z.object({ isActive: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Provide isActive (true or false)." });
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id) });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  const updated = await db.store.update({
+    where: { id: store.id },
+    data: {
+      isActive: parsed.data.isActive,
+      ...(parsed.data.isActive ? {} : { orderSyncNextAt: null, productSyncNextAt: null, orderSyncLockId: null, orderSyncLockUntil: null, productSyncLockId: null, productSyncLockUntil: null }),
+    },
+    include: { tokens: true },
+  });
+  await audit(parsed.data.isActive ? "store_activated" : "store_deactivated", req.auth!.id, store.id);
+  return res.json(publicStore(updated));
+});
+api.patch("/stores/:id/type", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const parsed = z.object({ storeType: z.nativeEnum(StoreType) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Provide a valid seller type (normal or choice)." });
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id) });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  const updated = await db.store.update({
+    where: { id: store.id },
+    data: { storeType: parsed.data.storeType },
+    include: { tokens: true },
+  });
+  await audit("store_type_updated", req.auth!.id, store.id, { storeType: parsed.data.storeType });
+  return res.json(publicStore(updated));
+});
+api.post("/stores/:id/products/sync", rateLimit(5, 60000), async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true } });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  if (!store.tokens) return res.status(409).json({ error: "Connect this store before syncing products." });
+  if (store.storeType === "choice") {
+    return res.status(409).json({ error: "Choice sellers cannot use the Daraz products API. Their SKUs are added automatically from orders." });
+  }
+  if (!store.isActive) return res.status(409).json({ error: "This store is inactive. Activate it in store settings before syncing products." });
+  if (!(await queueProductSync(store.id))) return res.status(409).json({ error: "A product sync is already running for this store." });
+  return res.status(202).json({ status: "queued", message: "Product catalog sync queued." });
+});
+api.post("/stores/:id/products/resync", rateLimit(5, 60000), async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true } });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  if (!store.tokens) return res.status(409).json({ error: "Connect this store before resyncing products." });
+  if (store.storeType === "choice") {
+    return res.status(409).json({ error: "Choice sellers cannot use the Daraz products API. Their SKUs are added automatically from orders." });
+  }
+  if (!store.isActive) return res.status(409).json({ error: "This store is inactive. Activate it in store settings before resyncing products." });
+  if (store.productSyncLockUntil && store.productSyncLockUntil > new Date()) {
+    return res.status(409).json({ error: "A product sync is already running for this store." });
+  }
+  await db.store.update({
+    where: { id: store.id },
+    data: {
+      productSyncLastAt: null,
+      productSyncOffset: 0,
+      productSyncNextAt: new Date(),
+      productSyncError: null,
+      productSyncLockId: null,
+      productSyncLockUntil: null,
+    },
+  });
+  await audit("store_products_full_resync", req.auth!.id, store.id);
+  void queueProductSync(store.id).catch((error: unknown) => {
+    console.error("Full product resync could not start:", error instanceof Error ? error.message : "Unknown worker error.");
+  });
+  return res.status(202).json({ status: "queued", message: "Full product resync queued from the start of the catalog." });
+});
 api.get("/stores/:id", async (req, res) => {
   const id = typeof req.params.id === "string" ? req.params.id : "";
-  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true, auditLogs: storeActivity } });
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id), include: { tokens: true, auditLogs: storeActivity, _count: { select: { orders: true, products: true } } } });
   if (!store) return res.status(404).json({ error: "Store not found." });
   const { auditLogs, ...rest } = store;
   return res.json({ ...publicStore(rest), activity: auditLogs });
@@ -423,7 +524,7 @@ api.post("/stores/:id/refresh", rateLimit(10, 60000), async (req, res) => {
   }
 });
 api.get("/dashboard", async (req, res) => {
-  const stores = await db.store.findMany({ where: { userId: req.auth!.id }, include: { tokens: true } });
+  const stores = await db.store.findMany({ where: { userId: req.auth!.id, isActive: true }, include: { tokens: true } });
   const now = Date.now();
   const summary = { total: stores.length, connected: 0, expiringSoon: 0, expired: 0 };
   for (const store of stores) {
@@ -434,6 +535,37 @@ api.get("/dashboard", async (req, res) => {
   }
   return res.json(summary);
 });
+api.get("/dashboard/stats", async (req, res) => {
+  const parsed = z.object({ days: z.coerce.number().int().min(7).max(90).default(14), storeId: z.string().optional() }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid dashboard range." });
+  if (parsed.data.storeId) {
+    const store = await db.store.findFirst({ where: { id: parsed.data.storeId, userId: req.auth!.id, isActive: true } });
+    if (!store) return res.status(404).json({ error: "Store not found." });
+  }
+  return res.json(await buildDashboardStats(req.auth!.id, parsed.data.days, parsed.data.storeId));
+});
+api.get("/dashboard/export", async (req, res) => {
+  const parsed = z.object({ days: z.coerce.number().int().min(7).max(90).default(14), storeId: z.string().optional() }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid dashboard range." });
+  if (parsed.data.storeId) {
+    const store = await db.store.findFirst({ where: { id: parsed.data.storeId, userId: req.auth!.id, isActive: true } });
+    if (!store) return res.status(404).json({ error: "Store not found." });
+  }
+  const stats = await buildDashboardStats(req.auth!.id, parsed.data.days, parsed.data.storeId);
+  const label = parsed.data.storeId ? stats.stores[0]?.label ?? "store" : "all-stores";
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="daraz-report-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${stats.range.days}d.csv"`);
+  return res.send(dashboardCsv(stats));
+});
+const orderStatusGroups = ["unpaid", "to_ship", "shipping", "delivered", "failed_delivery", "canceled", "returned"] as const;
+const orderListFilters = z.object({
+  storeId: z.string().trim().max(100).optional(),
+  statusGroup: z.enum(orderStatusGroups).optional(),
+  orderStatus: z.string().trim().max(100).optional(),
+  search: z.string().trim().max(200).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
 const orderSortFields = {
   customerName: "customerName",
   orderId: "darazOrderId",
@@ -442,45 +574,45 @@ const orderSortFields = {
   orderStatus: "orderStatus",
   deliveryStatus: "deliveryStatus",
   trackingNumber: "trackingNumber",
+  amount: "amount",
 } as const;
+const ownsStore = async (storeId: string, userId: string) =>
+  Boolean(await db.store.findFirst({ where: { id: storeId, userId, isActive: true }, select: { id: true } }));
+function orderWhere(filters: z.infer<typeof orderListFilters>, userId: string): Prisma.StoreOrderWhereInput {
+  const where: Prisma.StoreOrderWhereInput = {
+    store: { userId, isActive: true, ...(filters.storeId ? { id: filters.storeId } : {}) },
+  };
+  // Canceled orders are kept for the Cancellation lane but are never part of the default queue or totals.
+  where.statusGroup = filters.statusGroup ? filters.statusGroup : { not: "canceled" };
+  if (filters.orderStatus) where.orderStatus = { contains: filters.orderStatus, mode: "insensitive" };
+  if (filters.from || filters.to) {
+    where.orderCreatedAt = {
+      ...(filters.from ? { gte: filters.from } : {}),
+      ...(filters.to ? { lt: new Date(filters.to.getTime() + 86_400_000) } : {}),
+    };
+  }
+  if (filters.search) {
+    where.OR = [
+      { darazOrderId: { contains: filters.search, mode: "insensitive" } },
+      { customerName: { contains: filters.search, mode: "insensitive" } },
+      { trackingNumber: { contains: filters.search, mode: "insensitive" } },
+      { orderStatus: { contains: filters.search, mode: "insensitive" } },
+    ];
+  }
+  return where;
+}
 api.get("/orders", async (req, res) => {
-  const parsed = z.object({
+  const parsed = orderListFilters.extend({
     page: z.coerce.number().int().min(1).max(1_000_000).default(1),
     pageSize: z.coerce.number().int().min(1).max(100).default(25),
-    storeId: z.string().optional(),
-    search: z.string().trim().max(200).optional(),
-    orderStatus: z.string().trim().max(100).optional(),
-    deliveryStatus: z.string().trim().max(100).optional(),
-    from: z.string().date().optional(),
-    to: z.string().date().optional(),
-    sortBy: z.enum(["customerName", "orderId", "createdAt", "updatedAt", "orderStatus", "deliveryStatus", "trackingNumber"]).default("createdAt"),
+    sortBy: z.enum(["customerName", "orderId", "createdAt", "updatedAt", "orderStatus", "deliveryStatus", "trackingNumber", "amount"]).default("createdAt"),
     sortOrder: z.enum(["asc", "desc"]).default("desc"),
   }).safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: "Invalid order list filters." });
   const filters = parsed.data;
   if (filters.from && filters.to && filters.from > filters.to) return res.status(400).json({ error: "The start date must be before the end date." });
-  if (filters.storeId) {
-    const ownedStore = await db.store.findFirst({ where: ownedStoreFilter(filters.storeId, req.auth!.id), select: { id: true } });
-    if (!ownedStore) return res.status(404).json({ error: "Store not found." });
-  }
-  const where: Prisma.StoreOrderWhereInput = {
-    store: { userId: req.auth!.id, ...(filters.storeId ? { id: filters.storeId } : {}) },
-    ...(filters.orderStatus ? { orderStatus: { equals: filters.orderStatus, mode: "insensitive" } } : {}),
-    ...(filters.deliveryStatus ? { deliveryStatus: { equals: filters.deliveryStatus, mode: "insensitive" } } : {}),
-    ...(filters.search ? {
-      OR: [
-        { darazOrderId: { contains: filters.search, mode: "insensitive" } },
-        { customerName: { contains: filters.search, mode: "insensitive" } },
-        { trackingNumber: { contains: filters.search, mode: "insensitive" } },
-      ],
-    } : {}),
-    ...(filters.from || filters.to ? {
-      orderCreatedAt: {
-        ...(filters.from ? { gte: new Date(`${filters.from}T00:00:00.000Z`) } : {}),
-        ...(filters.to ? { lt: new Date(new Date(`${filters.to}T00:00:00.000Z`).getTime() + 86400000) } : {}),
-      },
-    } : {}),
-  };
+  if (filters.storeId && !(await ownsStore(filters.storeId, req.auth!.id))) return res.status(404).json({ error: "Store not found." });
+  const where = orderWhere(filters, req.auth!.id);
   const [total, orders] = await Promise.all([
     db.storeOrder.count({ where }),
     db.storeOrder.findMany({
@@ -490,19 +622,243 @@ api.get("/orders", async (req, res) => {
       take: filters.pageSize,
       select: {
         id: true, storeId: true, darazOrderId: true, customerName: true,
-        orderCreatedAt: true, orderUpdatedAt: true, orderStatus: true,
-        deliveryStatus: true, trackingNumber: true, syncedAt: true,
-        store: { select: { label: true, country: true } },
+        orderCreatedAt: true, orderUpdatedAt: true, orderStatus: true, statusGroup: true,
+        deliveryStatus: true, trackingNumber: true, amount: true, itemCount: true, syncedAt: true,
+        store: { select: { label: true, country: true, storeType: true } },
       },
     }),
   ]);
   return res.json({ orders, page: filters.page, pageSize: filters.pageSize, total, totalPages: Math.ceil(total / filters.pageSize) });
 });
-api.get("/orders/:id", async (req, res) => {
+api.get("/orders/summary", async (req, res) => {
+  const parsed = orderListFilters.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid order filters." });
+  const filters = parsed.data;
+  if (filters.storeId && !(await ownsStore(filters.storeId, req.auth!.id))) return res.status(404).json({ error: "Store not found." });
+  // Lane counts are only useful once a store is selected; skip the aggregate entirely for "All stores"
+  // so the page does not scan the whole order table on every load.
+  if (!filters.storeId) return res.json({ groups: {} });
+  const where = orderWhere({ ...filters, statusGroup: undefined }, req.auth!.id);
+  const [groups, toShipRows] = await Promise.all([
+    db.storeOrder.groupBy({
+      by: ["statusGroup"],
+      where: { ...where, statusGroup: { in: ["unpaid", "to_ship", "shipping"] } },
+      _count: { _all: true },
+    }),
+    db.storeOrder.groupBy({
+      by: ["orderStatus"],
+      where: { ...where, statusGroup: "to_ship" },
+      _count: { _all: true },
+    }),
+  ]);
+  const counts: Record<string, number> = { unpaid: 0, to_ship: 0, shipping: 0 };
+  for (const row of groups) {
+    if (row.statusGroup && row.statusGroup in counts) counts[row.statusGroup] += row._count._all;
+  }
+  // Daraz's To Ship lane splits into Pending, Ready to Ship and Packed.
+  const toShip: Record<string, number> = { pending: 0, ready_to_ship: 0, packed: 0 };
+  for (const row of toShipRows) {
+    const raw = (row.orderStatus ?? "").toLowerCase();
+    const key = raw.includes("pending") ? "pending" : raw.includes("ready_to_ship") ? "ready_to_ship" : raw.includes("packed") ? "packed" : null;
+    if (key) toShip[key] += row._count._all;
+  }
+  return res.json({ groups: counts, toShip });
+});
+api.get("/orders/export", rateLimit(10, 60000), async (req, res) => {
+  const parsed = orderListFilters.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid order filters." });
+  const filters = parsed.data;
+  if (filters.storeId && !(await ownsStore(filters.storeId, req.auth!.id))) return res.status(404).json({ error: "Store not found." });
+  const orders = await db.storeOrder.findMany({
+    where: orderWhere(filters, req.auth!.id),
+    orderBy: { orderCreatedAt: "desc" },
+    select: {
+      darazOrderId: true, customerName: true, orderCreatedAt: true, orderStatus: true,
+      deliveryStatus: true, trackingNumber: true, amount: true, itemCount: true,
+      store: { select: { label: true } },
+    },
+  });
+  const header = ["Order ID", "Store", "Customer", "Created (UTC)", "Status", "Delivery", "Tracking", "Amount", "Items"];
+  const rows = orders.map((order) => [
+    order.darazOrderId, order.store.label, order.customerName ?? "", order.orderCreatedAt.toISOString(),
+    order.orderStatus ?? "", order.deliveryStatus ?? "", order.trackingNumber ?? "",
+    order.amount?.toString() ?? "", order.itemCount ?? "",
+  ]);
+  const csv = [header, ...rows]
+    .map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(","))
+    .join("\r\n");
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="daraz-orders-${new Date().toISOString().slice(0, 10)}.csv"`);
+  return res.send(csv);
+});
+api.get("/orders/:id", rateLimit(30, 60000), async (req, res) => {
   const id = typeof req.params.id === "string" ? req.params.id : "";
-  const order = await db.storeOrder.findFirst({ where: { id, store: { userId: req.auth!.id } } });
+  const order = await db.storeOrder.findFirst({ where: { id, store: { userId: req.auth!.id, isActive: true } } });
   if (!order) return res.status(404).json({ error: "Order not found." });
-  return res.json(order);
+  // List sync stores the order summary; the full detail (items, address, tracking) is loaded on
+  // first view and then cached in rawDetails. `?refresh=1` forces a re-fetch from Daraz.
+  const raw = order.rawDetails as { data?: { order_items?: unknown } } | null;
+  const cachedItems = raw && typeof raw === "object" ? raw.data?.order_items : undefined;
+  if (req.query.refresh !== "1" && Array.isArray(cachedItems) && cachedItems.length > 0) return res.json(order);
+  const store = await db.store.findFirst({ where: { id: order.storeId }, include: { tokens: true } });
+  if (!store?.tokens) return res.status(409).json({ error: "Reconnect this store to load order details." });
+  try {
+    const accessToken = await fetchAccessToken(store);
+    const detailBody = await fetchDarazOrderDetails(store.country, accessToken, order.darazOrderId);
+    let items: Record<string, unknown>[] = [];
+    try {
+      const itemsBody = await fetchDarazOrderItems(store.country, accessToken, order.darazOrderId);
+      items = Array.isArray((itemsBody as { data?: unknown }).data) ? (itemsBody as { data: Record<string, unknown>[] }).data : [];
+    } catch {
+      items = [];
+    }
+    const detail = orderDetailRecord(detailBody);
+    const detailData = (detailBody as { data?: Record<string, unknown> }).data ?? {};
+    const mergedRaw = { ...(detailBody as Record<string, unknown>), data: { ...detailData, order_items: items } };
+    const normalized = normalizeOrder({ ...detail, order_items: items }, order.darazOrderId);
+    const updated = await db.storeOrder.update({
+      where: { id: order.id },
+      data: { ...normalized, rawDetails: mergedRaw as Prisma.InputJsonValue, itemsSyncedAt: new Date(), syncedAt: new Date() },
+    });
+    await upsertProductsFromOrderItems(order.storeId, items);
+    return res.json(updated);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load order details from Daraz.";
+    return res.status(502).json({ error: safeDarazErrorMessage(store.country, message) });
+  }
+});
+api.get("/orders/:id/awb", rateLimit(20, 60000), async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const order = await db.storeOrder.findFirst({
+    where: { id, store: { userId: req.auth!.id } },
+    include: { store: { include: { tokens: true } } },
+  });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  if (!order.store.tokens) return res.status(409).json({ error: "Reconnect this store before printing an AWB." });
+  if (!order.store.isActive) return res.status(409).json({ error: "This store is inactive. Activate it before printing AWBs." });
+  if (order.store.storeType === "choice") return res.status(409).json({ error: "This is a Choice seller store; Daraz handles fulfilment and AWB printing.", choiceSeller: true });
+
+  let accessToken: string;
+  let items: Record<string, unknown>[] = [];
+  try {
+    accessToken = await fetchAccessToken(order.store);
+    const itemsBody = await fetchDarazOrderItems(order.store.country, accessToken, order.darazOrderId);
+    items = Array.isArray((itemsBody as { data?: unknown }).data) ? (itemsBody as { data: Record<string, unknown>[] }).data : [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load this order from Daraz.";
+    return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, message) });
+  }
+
+  const packages = [...new Set(items.map((item) => String(item.package_id ?? "")).filter(Boolean))];
+  if (!packages.length) {
+    return res.status(409).json({ error: "Daraz has not created a package or tracking number for this order yet.", canMarkShipping: false });
+  }
+
+  try {
+    const documentBody = await fetchPackageAwbDocuments(order.store.country, accessToken, packages);
+    const result = (documentBody as { result?: { success?: boolean; error_msg?: string; error_code?: string; data?: { pdf_url?: string } } }).result;
+    if (result?.success && result.data?.pdf_url) {
+      return res.json({ source: "daraz", pdfUrl: result.data.pdf_url, packages, trackingNumber: order.trackingNumber ?? null });
+    }
+    const message = result?.error_msg ?? "Daraz did not return an AWB PDF for this order.";
+    return res.status(result?.error_code === "30017" ? 409 : 502).json({
+      error: safeDarazErrorMessage(order.store.country, message),
+      code: result?.error_code ?? null,
+      canMarkShipping: false,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Daraz did not return an AWB PDF for this order.";
+    return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, message) });
+  }
+});
+api.post("/orders/:id/package", rateLimit(10, 60000), async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const order = await db.storeOrder.findFirst({
+    where: { id, store: { userId: req.auth!.id } },
+    include: { store: { include: { tokens: true } } },
+  });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  if (!order.store.tokens) return res.status(409).json({ error: "Reconnect this store before creating a package." });
+  if (!order.store.isActive) return res.status(409).json({ error: "This store is inactive. Activate it before creating packages." });
+  if (order.store.storeType === "choice") return res.status(409).json({ error: "This is a Choice seller store; Daraz handles fulfilment and AWB printing.", choiceSeller: true });
+
+  let accessToken: string;
+  let items: Record<string, unknown>[] = [];
+  try {
+    accessToken = await fetchAccessToken(order.store);
+    const itemsBody = await fetchDarazOrderItems(order.store.country, accessToken, order.darazOrderId);
+    items = Array.isArray((itemsBody as { data?: unknown }).data) ? (itemsBody as { data: Record<string, unknown>[] }).data : [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load this order from Daraz.";
+    return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, message) });
+  }
+
+  const packages = [...new Set(items.map((item) => String(item.package_id ?? "")).filter(Boolean))];
+  if (packages.length) {
+    return res.json({ created: false, message: "This order already has a package and tracking number.", packages, trackingNumber: order.trackingNumber ?? null });
+  }
+  const itemIds = items.map((item) => String(item.order_item_id ?? "")).filter(Boolean);
+  if (!itemIds.length) return res.status(409).json({ error: "Daraz returned no order items, so a package cannot be created." });
+
+  try {
+    const body = await createOrderPackages(order.store.country, accessToken, order.darazOrderId, itemIds);
+    const result = (body as { result?: { success?: boolean; error_msg?: string; error_code?: string; data?: Record<string, unknown> } }).result;
+    if (!result?.success) {
+      return res.status(502).json({
+        error: safeDarazErrorMessage(order.store.country, result?.error_msg ?? "Daraz rejected the package request."),
+        code: result?.error_code ?? null,
+      });
+    }
+    const createdPackages = Array.isArray((result.data as { packages?: unknown })?.packages)
+      ? ((result.data as { packages: Array<Record<string, unknown>> }).packages)
+      : [];
+    await audit("order_package_created", req.auth!.id, order.storeId, { orderId: order.darazOrderId, packages: createdPackages as Prisma.InputJsonValue });
+    return res.json({ created: true, data: result.data ?? {}, packages: createdPackages });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Daraz rejected the package request.";
+    return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, message) });
+  }
+});
+api.post("/orders/:id/rts", rateLimit(10, 60000), async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const order = await db.storeOrder.findFirst({
+    where: { id, store: { userId: req.auth!.id } },
+    include: { store: { include: { tokens: true } } },
+  });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  if (!order.store.tokens) return res.status(409).json({ error: "Reconnect this store before changing its shipping status." });
+  if (!order.store.isActive) return res.status(409).json({ error: "This store is inactive. Activate it before changing shipping status." });
+  if (order.store.storeType === "choice") return res.status(409).json({ error: "This is a Choice seller store; Daraz handles fulfilment and AWB printing.", choiceSeller: true });
+
+  let accessToken: string;
+  let packages: string[] = [];
+  try {
+    accessToken = await fetchAccessToken(order.store);
+    const itemsBody = await fetchDarazOrderItems(order.store.country, accessToken, order.darazOrderId);
+    const items = Array.isArray((itemsBody as { data?: unknown }).data) ? (itemsBody as { data: Record<string, unknown>[] }).data : [];
+    packages = [...new Set(items.map((item) => String(item.package_id ?? "")).filter(Boolean))];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load this order from Daraz.";
+    return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, message) });
+  }
+  if (!packages.length) {
+    return res.status(409).json({ error: "Create a package first â€” this order has no tracking number yet." });
+  }
+
+  try {
+    const rtsBody = await markPackagesReadyToShip(order.store.country, accessToken, packages);
+    const result = (rtsBody as { result?: { success?: boolean; error_msg?: string; data?: { packages?: Array<{ package_id?: string; msg?: string; item_err_code?: string }> } } }).result;
+    const failed = (result?.data?.packages ?? []).filter((entry) => String(entry.item_err_code ?? "0") !== "0");
+    if (!result?.success || failed.length) {
+      const reason = failed.map((entry) => `${entry.package_id ?? "package"}: ${entry.msg ?? "failed"}`).join("; ") || result?.error_msg || "Daraz rejected the ready-to-ship request.";
+      return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, reason) });
+    }
+    await audit("order_marked_ready_to_ship", req.auth!.id, order.storeId, { orderId: order.darazOrderId, packages });
+    return res.json({ marked: true, packages });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Daraz rejected the ready-to-ship request.";
+    return res.status(502).json({ error: safeDarazErrorMessage(order.store.country, message) });
+  }
 });
 api.get("/products", async (req, res) => {
   const parsed = z.object({
@@ -517,25 +873,37 @@ api.get("/products", async (req, res) => {
     return res.status(404).json({ error: "Store not found." });
   }
   const where: Prisma.ProductMasterWhereInput = {
-    store: { userId: req.auth!.id, ...(storeId ? { id: storeId } : {}) },
+    store: { userId: req.auth!.id, isActive: true, ...(storeId ? { id: storeId } : {}) },
     ...(search ? { OR: [
       { darazItemId: { contains: search, mode: "insensitive" } },
       { sellerSku: { contains: search, mode: "insensitive" } },
       { name: { contains: search, mode: "insensitive" } },
+      { variants: { some: { sku: { contains: search, mode: "insensitive" } } } },
     ] } : {}),
   };
   const [total, products] = await Promise.all([
     db.productMaster.count({ where }),
     db.productMaster.findMany({
       where, orderBy: { name: "asc" }, skip: (page - 1) * pageSize, take: pageSize,
-      select: { id: true, storeId: true, darazItemId: true, sellerSku: true, name: true, status: true, fetchedAt: true, store: { select: { label: true, country: true } } },
+      select: {
+        id: true, storeId: true, darazItemId: true, sellerSku: true, name: true, brand: true, status: true,
+        imageUrl: true, price: true, specialPrice: true, quantity: true, syncedFrom: true, fetchedAt: true,
+        _count: { select: { variants: true } },
+        store: { select: { label: true, country: true, storeType: true } },
+      },
     }),
   ]);
   return res.json({ products, page, pageSize, total, totalPages: Math.ceil(total / pageSize) });
 });
 api.get("/products/:id", async (req, res) => {
   const id = typeof req.params.id === "string" ? req.params.id : "";
-  const product = await db.productMaster.findFirst({ where: { id, store: { userId: req.auth!.id } } });
+  const product = await db.productMaster.findFirst({
+    where: { id, store: { userId: req.auth!.id, isActive: true } },
+    include: {
+      variants: { orderBy: [{ size: "asc" }, { sku: "asc" }] },
+      store: { select: { label: true, country: true, storeType: true } },
+    },
+  });
   if (!product) return res.status(404).json({ error: "Product not found." });
   return res.json(product);
 });
@@ -555,6 +923,114 @@ api.patch("/admin/users/:id", requireAdmin, async (req, res) => {
   const user = await db.user.update({ where: { id }, data, select: { id: true, name: true, email: true, role: true, isActive: true } });
   if (parsed.data.isActive === false || parsed.data.password) await db.session.deleteMany({ where: { userId: user.id } });
   return res.json(user);
+});
+api.get("/admin/logs", requireAdmin, async (req, res) => {
+  const storeId = typeof req.query.storeId === "string" && req.query.storeId ? req.query.storeId : undefined;
+  const stores = await db.store.findMany({
+    select: {
+      id: true, label: true, country: true, storeType: true, isActive: true, status: true,
+      orderSyncLastAt: true, orderSyncNextAt: true, orderSyncLockUntil: true, orderSyncError: true,
+      orderBackfillDone: true, orderBackfillCursor: true, orderSyncFrequency: true,
+      productSyncLastAt: true, productSyncNextAt: true, productSyncLockUntil: true, productSyncError: true, productSyncOffset: true,
+      user: { select: { name: true, email: true } },
+      tokens: { select: { accessExpiresAt: true, refreshExpiresAt: true } },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  const scoped = storeId ? stores.filter((store) => store.id === storeId) : stores;
+  const [productCounts] = await Promise.all([
+    db.productMaster.groupBy({ by: ["storeId"], where: { storeId: { in: stores.map((store) => store.id) } }, _count: { _all: true } }),
+  ]);
+  const productCount = (id: string) => productCounts.find((row) => row.storeId === id)?._count._all ?? 0;
+  const logs = await db.auditLog.findMany({
+    where: storeId ? { storeId } : {},
+    orderBy: { createdAt: "desc" },
+    take: 100,
+    include: { user: { select: { email: true } }, store: { select: { label: true } } },
+  });
+  const now = new Date();
+  const jobs: Array<Record<string, unknown>> = [];
+  const syncState = (lastAt: Date | null, nextAt: Date | null, lockUntil: Date | null, error: string | null) => {
+    if (lockUntil && lockUntil > now) return "running";
+    if (error) return "failed";
+    if (nextAt && nextAt <= now) return "queued";
+    if (nextAt) return "scheduled";
+    return "idle";
+  };
+  for (const store of scoped) {
+    jobs.push({
+      id: `${store.id}:orders`,
+      storeId: store.id,
+      storeLabel: store.label,
+      kind: "orders",
+      state: syncState(store.orderSyncLastAt, store.orderSyncNextAt, store.orderSyncLockUntil, store.orderSyncError),
+      lastAt: store.orderSyncLastAt,
+      nextAt: store.orderSyncNextAt,
+      lockUntil: store.orderSyncLockUntil,
+      error: store.orderSyncError,
+      progress: store.orderBackfillDone
+        ? "Backfill complete"
+        : store.orderBackfillCursor
+          ? `Backfill resumes from ${store.orderBackfillCursor.toISOString().slice(0, 10)}`
+          : "Waiting for first backfill",
+    });
+    if (store.storeType !== "choice") {
+      jobs.push({
+        id: `${store.id}:products`,
+        storeId: store.id,
+        storeLabel: store.label,
+        kind: "products",
+        state: syncState(store.productSyncLastAt, store.productSyncNextAt, store.productSyncLockUntil, store.productSyncError),
+        lastAt: store.productSyncLastAt,
+        nextAt: store.productSyncNextAt,
+        lockUntil: store.productSyncLockUntil,
+        error: store.productSyncError,
+        progress: store.productSyncOffset > 0 ? `${store.productSyncOffset} products processed` : "Catalog sync idle",
+      });
+    }
+  }
+  return res.json({
+    generatedAt: now.toISOString(),
+    storeOptions: stores.map((store) => ({ id: store.id, label: store.label, isActive: store.isActive })),
+    stores: scoped.map((store) => ({
+      id: store.id,
+      label: store.label,
+      country: store.country,
+      storeType: store.storeType,
+      isActive: store.isActive,
+      owner: store.user,
+      status: displayStoreStatus(store),
+      orders: null,
+      products: productCount(store.id),
+      orderSync: {
+        lastAt: store.orderSyncLastAt,
+        nextAt: store.orderSyncNextAt,
+        lockUntil: store.orderSyncLockUntil,
+        running: Boolean(store.orderSyncLockUntil && store.orderSyncLockUntil > now),
+        backfillDone: store.orderBackfillDone,
+        backfillCursor: store.orderBackfillCursor,
+        frequency: store.orderSyncFrequency,
+        error: store.orderSyncError,
+      },
+      productSync: {
+        lastAt: store.productSyncLastAt,
+        nextAt: store.productSyncNextAt,
+        lockUntil: store.productSyncLockUntil,
+        running: Boolean(store.productSyncLockUntil && store.productSyncLockUntil > now),
+        offset: store.productSyncOffset,
+        error: store.productSyncError,
+      },
+    })),
+    jobs,
+    logs: logs.map((entry) => ({
+      id: entry.id,
+      action: entry.action,
+      createdAt: entry.createdAt,
+      userEmail: entry.user?.email ?? null,
+      storeLabel: entry.store?.label ?? null,
+      meta: entry.meta,
+    })),
+  });
 });
 api.get("/admin/stores", requireAdmin, async (_req, res) => {
   const stores = await db.store.findMany({ include: { user: { select: { name: true, email: true } }, tokens: true }, orderBy: { createdAt: "desc" } });
@@ -580,11 +1056,17 @@ if (config.NODE_ENV === "production") {
 }
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  if (err instanceof Error) console.error("Unhandled request error:", err.name, err.message.split("\n")[0]);
-  else console.error("Unhandled request error: unknown error");
+  if (err instanceof Error) {
+    const rawCode = (err as unknown as { code?: unknown }).code;
+    const code = typeof rawCode === "string" ? ` [${rawCode}]` : "";
+    console.error("Unhandled request error:", err.name + code, err.message.split("\n")[0]);
+  } else {
+    console.error("Unhandled request error: unknown error");
+  }
   return res.status(500).json({ error: "An unexpected error occurred." });
 });
 app.listen(config.PORT, () => {
   console.log(`Daraz Store Hub API listening on ${config.PORT}`);
   startOrderSyncWorker();
+  startProductSyncWorker();
 });

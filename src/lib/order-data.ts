@@ -1,5 +1,14 @@
 export type JsonRecord = Record<string, unknown>;
 
+export type OrderStatusGroup =
+  | "unpaid"
+  | "to_ship"
+  | "shipping"
+  | "delivered"
+  | "failed_delivery"
+  | "canceled"
+  | "returned";
+
 export type NormalizedOrder = {
   darazOrderId: string;
   customerName: string | null;
@@ -8,6 +17,9 @@ export type NormalizedOrder = {
   orderStatus: string | null;
   deliveryStatus: string | null;
   trackingNumber: string | null;
+  statusGroup: OrderStatusGroup | null;
+  amount: string | null;
+  itemCount: number | null;
 };
 
 const record = (value: unknown): JsonRecord | null =>
@@ -16,8 +28,30 @@ const record = (value: unknown): JsonRecord | null =>
 const scalarString = (value: unknown): string | null =>
   typeof value === "string" || typeof value === "number" ? String(value) : null;
 
+const integer = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number.parseInt(value, 10);
+  return null;
+};
+
 const fieldString = (value: unknown): string | null =>
   Array.isArray(value) ? value.map(scalarString).filter((part): part is string => Boolean(part)).join(", ") || null : scalarString(value);
+
+/** Maps Daraz's `statuses` array onto the seller-center order-management tabs. */
+export function orderStatusGroup(statuses: unknown): OrderStatusGroup | null {
+  const values = (Array.isArray(statuses) ? statuses : statuses === undefined || statuses === null || statuses === "" ? [] : [statuses])
+    .map((value) => String(value).toLowerCase());
+  const has = (...needles: string[]) => values.some((value) => needles.some((needle) => value.includes(needle)));
+  if (has("returned", "shipped_back", "return_pending")) return "returned";
+  if (has("failed_delivery", "lost_by_3pl", "damaged_by_3pl", "failed")) return "failed_delivery";
+  if (has("canceled", "cancelled")) return "canceled";
+  if (has("delivered")) return "delivered";
+  if (has("shipped", "shipping")) return "shipping";
+  if (has("ready_to_ship", "packed")) return "to_ship";
+  if (has("pending", "unpaid")) return "unpaid";
+  return null;
+}
+
 
 const first = (object: JsonRecord, ...keys: string[]) => {
   for (const key of keys) {
@@ -39,6 +73,10 @@ function dateValue(value: unknown, field: string, required = false): Date | null
 
 export function orderCreatedAt(order: JsonRecord): Date | null {
   return dateValue(first(order, "created_at", "createdAt", "order_created_at"), "created_at");
+}
+
+export function orderUpdatedAt(order: JsonRecord): Date | null {
+  return dateValue(first(order, "updated_at", "updatedAt", "order_updated_at"), "updated_at");
 }
 
 export function orderRecords(response: unknown): JsonRecord[] {
@@ -91,14 +129,18 @@ export function normalizeOrder(order: JsonRecord, fallbackOrderId?: string): Nor
   const deliveryStatus = scalarString(first(order, "delivery_status", "shipment_status", "shipping_status"))
     ?? ([...new Set(itemRecords.map((item) => scalarString(first(item, "delivery_status", "shipment_status", "shipping_status", "status"))).filter((value): value is string => Boolean(value)))].join(", ") || null);
 
+  const statusesValue = first(order, "statuses", "status", "order_status");
   return {
     darazOrderId: orderId,
     customerName,
     orderCreatedAt: dateValue(first(order, "created_at", "createdAt", "order_created_at"), "created_at", true)!,
     orderUpdatedAt: dateValue(first(order, "updated_at", "updatedAt", "order_updated_at"), "updated_at"),
-    orderStatus: fieldString(first(order, "statuses", "status", "order_status")),
+    orderStatus: fieldString(statusesValue),
     deliveryStatus,
     trackingNumber: tracking,
+    statusGroup: orderStatusGroup(statusesValue),
+    amount: scalarString(first(order, "price", "order_price", "total_price")),
+    itemCount: integer(first(order, "items_count", "item_count")),
   };
 }
 
@@ -122,6 +164,10 @@ export function productRecords(response: unknown): JsonRecord[] {
     return result;
   });
   const entries = first(data, "products", "items", "product");
+  if (entries === undefined && (data.total_products === 0 || Object.keys(data).length === 0)) {
+    // An empty catalog can come back without a products array.
+    return [];
+  }
   if (!Array.isArray(entries)) throw new Error("Daraz products API returned an unexpected response.");
   return entries.map((entry) => {
     const result = record(entry);
