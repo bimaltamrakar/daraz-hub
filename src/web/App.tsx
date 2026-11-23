@@ -578,6 +578,7 @@ type DashboardStats = {
   comparison: { salesPct: number | null; ordersPct: number | null; aovPct: number | null; unitsPct: number | null };
   windows: { today: number; last7: number };
   trend: { days: number; points: Array<{ date: string; total: number; byStore?: Record<string, number> }> };
+  orderTrend: { days: number; points: Array<{ date: string; total: number; byStore?: Record<string, number> }> };
   statusTrend: Array<{ date: string; orders: number; canceled: number; returned: number }>;
   ordersByGroup: Record<string, number>;
   stores: Array<{
@@ -665,6 +666,55 @@ function SalesLineChart({ points, stores, hidden, showTotal }: {
   </svg>;
 }
 
+function OrdersLineChart({ points, stores, hidden, showTotal }: {
+  points: Array<{ date: string; total: number; byStore?: Record<string, number> }>;
+  stores: DashboardStats["stores"];
+  hidden: Set<string>;
+  showTotal: boolean;
+}) {
+  const width = 760;
+  const height = 220;
+  const pad = { top: 14, right: 16, bottom: 30, left: 44 };
+  const innerWidth = width - pad.left - pad.right;
+  const innerHeight = height - pad.top - pad.bottom;
+  const series = stores
+    .map((store, index) => ({
+      id: store.id,
+      label: store.label,
+      color: STORE_COLORS[index % STORE_COLORS.length],
+      values: points.map((point) => Number(point.byStore?.[store.id] ?? 0)),
+    }))
+    .filter((entry) => !hidden.has(entry.id));
+  if (showTotal) series.push({ id: "__total", label: "Total", color: "#20252d", values: points.map((point) => point.total) });
+
+  const max = Math.max(1, ...series.flatMap((entry) => entry.values));
+  const x = (index: number) => pad.left + (points.length <= 1 ? 0 : (innerWidth * index) / (points.length - 1));
+  const y = (value: number) => pad.top + innerHeight * (1 - value / max);
+  const grid = [0, 0.25, 0.5, 0.75, 1];
+  const labelStep = Math.max(1, Math.ceil(points.length / 6));
+
+  return <svg className="line-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Orders per day by store">
+    {grid.map((fraction) => <g key={fraction}>
+      <line x1={pad.left} x2={width - pad.right} y1={pad.top + innerHeight * fraction} y2={pad.top + innerHeight * fraction} stroke="#eef0f2" />
+      <text x={pad.left - 8} y={pad.top + innerHeight * fraction + 4} textAnchor="end" fontSize="10" fill="#9aa1a9">{Math.round(max * (1 - fraction))}</text>
+    </g>)}
+    {series.map((entry) => {
+      const line = entry.values.map((value, index) => `${index === 0 ? "M" : "L"}${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ");
+      return <g key={entry.id}>
+        <path d={line} fill="none" stroke={entry.color} strokeWidth={entry.id === "__total" ? 2.5 : 2} strokeDasharray={entry.id === "__total" ? "6 4" : undefined} strokeLinejoin="round" strokeLinecap="round" />
+        {points.length <= 31 && entry.values.map((value, index) => value > 0
+          ? <circle key={`${entry.id}-${points[index].date}`} cx={x(index)} cy={y(value)} r="2.6" fill="#fff" stroke={entry.color} strokeWidth="1.8">
+            <title>{`${entry.label} · ${points[index].date}: ${value.toLocaleString()} orders`}</title>
+          </circle>
+          : null)}
+      </g>;
+    })}
+    {points.map((point, index) => index % labelStep === 0 || index === points.length - 1
+      ? <text key={`orders-${point.date}`} x={x(index)} y={height - 8} textAnchor="middle" fontSize="9" fill="#9aa1a9">{point.date.slice(5)}</text>
+      : null)}
+  </svg>;
+}
+
 function StoreSalesBars({ stores }: { stores: DashboardStats["stores"] }) {
   const sorted = [...stores].sort((first, second) => second.sales - first.sales);
   const max = Math.max(1, ...sorted.map((store) => store.sales));
@@ -744,6 +794,8 @@ function Dashboard({ token, onOpenStore, onManageStores }: { token: string; onOp
   const [updatedAt, setUpdatedAt] = useState("");
   const [hiddenStores, setHiddenStores] = useState<Set<string>>(new Set());
   const [showTotal, setShowTotal] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncNote, setSyncNote] = useState("");
 
   const toggleStoreSeries = (id: string) => setHiddenStores((previous) => {
     const next = new Set(previous);
@@ -771,6 +823,43 @@ function Dashboard({ token, onOpenStore, onManageStores }: { token: string; onOp
     const timer = setInterval(() => { void load(); }, 30_000);
     return () => clearInterval(timer);
   }, [live, load]);
+
+  async function syncOrdersNow() {
+    if (!storeId) return;
+    setSyncBusy(true);
+    setSyncNote("Queueing…");
+    let finished = false;
+    try {
+      const before = await api(`/stores/${storeId}`, token);
+      const beforeCount = before._count?.orders ?? 0;
+      const beforeLast = before.orderSyncLastAt ?? null;
+      await api(`/stores/${storeId}/orders/sync`, token, { method: "POST" });
+      setSyncNote("Syncing…");
+      for (let attempt = 0; attempt < 45; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const current = await api(`/stores/${storeId}`, token);
+        if (current.orderSyncError) {
+          setSyncNote(`Sync error: ${String(current.orderSyncError).slice(0, 140)}`);
+          finished = true;
+          break;
+        }
+        if (current.orderSyncLastAt && current.orderSyncLastAt !== beforeLast && !current.orderSyncRunning) {
+          const afterCount = current._count?.orders ?? 0;
+          const delta = afterCount - beforeCount;
+          setSyncNote(`${Math.max(delta, 0).toLocaleString()} new orders synced · ${afterCount.toLocaleString()} total`);
+          await load();
+          finished = true;
+          break;
+        }
+        setSyncNote(`Syncing… ${(attempt + 1) * 2}s`);
+      }
+      if (!finished) setSyncNote("Still syncing — check Administration → Store logs.");
+    } catch (e) {
+      setSyncNote(e instanceof Error ? e.message : "Unable to sync orders.");
+    } finally {
+      setSyncBusy(false);
+    }
+  }
 
   async function exportCsv() {
     try {
@@ -815,9 +904,10 @@ function Dashboard({ token, onOpenStore, onManageStores }: { token: string; onOp
         </select>
         <button className={live ? "secondary live-on" : "secondary"} onClick={() => setLive((value) => !value)}><span className={live ? "dot" : "dot offline"} /> {live ? "Live" : "Paused"}</button>
         <button className="secondary" onClick={() => void load()}>Refresh</button>
+        <button className="secondary" disabled={!storeId || syncBusy} title={!storeId ? "Select a store to sync its orders" : "Run an order sync now"} onClick={() => void syncOrdersNow()}>{syncBusy ? "Syncing…" : "Sync orders"}</button>
         <button className="secondary" onClick={() => void exportCsv()}>Export CSV</button>
       </div>
-      <span className="dash-updated">{scopeLabel} · last {days} days · updated {updatedAt}{live ? " · refreshes every 30s" : ""}</span>
+      <span className="dash-updated">{scopeLabel} · last {days} days · updated {updatedAt}{live ? " · refreshes every 30s" : ""}{syncNote && <span className="sync-note"> · {syncNote}</span>}</span>
     </div>
 
     <div className="stat-grid">
@@ -858,6 +948,21 @@ function Dashboard({ token, onOpenStore, onManageStores }: { token: string; onOp
         <StoreSalesBars stores={stats.stores} />
       </section>
     </div>
+
+    <section className="panel">
+      <div className="chart-head">
+        <div><h2>Orders per day</h2><p className="muted">Non-canceled orders per store · {scopeLabel} · last {days} days · click a legend item to hide/show</p></div>
+      </div>
+      <div className="chart-legend">
+        {stats.stores.map((store, index) => <button key={store.id} type="button" className={`legend-item ${hiddenStores.has(store.id) ? "off" : ""}`} onClick={() => toggleStoreSeries(store.id)} title={`Toggle ${store.label}`}>
+          <span className="legend-swatch" style={{ background: STORE_COLORS[index % STORE_COLORS.length] }} />{store.label}
+        </button>)}
+        <button type="button" className={`legend-item ${showTotal ? "" : "off"}`} onClick={() => setShowTotal((value) => !value)} title="Toggle total line">
+          <span className="legend-swatch" style={{ background: "#20252d" }} />Total
+        </button>
+      </div>
+      <OrdersLineChart points={stats.orderTrend.points} stores={stats.stores} hidden={hiddenStores} showTotal={showTotal} />
+    </section>
 
     <div className="dash-panels">
       <section className="panel">

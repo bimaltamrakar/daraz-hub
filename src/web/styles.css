@@ -114,3 +114,4 @@
 .job-state.failed{background:#fdecea;color:#b03a2e}
 .job-state.scheduled{background:#eef4fb;color:#2f62b5}
 @keyframes job-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.sync-note{color:#5b6470;font-weight:600}

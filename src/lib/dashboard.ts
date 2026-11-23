@@ -50,6 +50,7 @@ export async function buildDashboardStats(userId: string, days: number, storeId?
       comparison: { salesPct: null, ordersPct: null, aovPct: null, unitsPct: null },
       windows: { today: 0, last7: 0 },
       trend: { days, points: [] },
+      orderTrend: { days, points: [] },
       statusTrend: [],
       ordersByGroup: {},
       stores: [],
@@ -63,7 +64,7 @@ export async function buildDashboardStats(userId: string, days: number, storeId?
     };
   }
 
-  const [currentGroups, previousGroupCounts, currentSales, previousSales, products, variants, statusDayRows, heatRows, topRows, categoryRows, unitsRows, previousUnitsRows, soldRows] = await Promise.all([
+  const [currentGroups, previousGroupCounts, currentSales, previousSales, products, variants, statusDayRows, orderTrendRows, heatRows, topRows, categoryRows, unitsRows, previousUnitsRows, soldRows] = await Promise.all([
     db.storeOrder.groupBy({
       by: ["storeId", "statusGroup"],
       where: { storeId: { in: storeIds }, statusGroup: { not: "canceled" }, orderCreatedAt: { gte: since } },
@@ -97,6 +98,12 @@ export async function buildDashboardStats(userId: string, days: number, storeId?
       WHERE "storeId" IN (${Prisma.join(storeIds)}) AND "orderCreatedAt" >= ${since} AND "statusGroup" <> 'canceled'
       GROUP BY 1
       ORDER BY 1
+    `,
+    db.$queryRaw<Array<{ day: Date; storeId: string; count: number }>>`
+      SELECT DATE("orderCreatedAt") AS day, "storeId", COUNT(*)::int AS count
+      FROM "StoreOrder"
+      WHERE "storeId" IN (${Prisma.join(storeIds)}) AND "orderCreatedAt" >= ${since} AND "statusGroup" <> 'canceled'
+      GROUP BY 1, 2
     `,
     db.$queryRaw<Array<{ dow: number; hour: number; revenue: number; orders: number }>>`
       SELECT EXTRACT(DOW FROM "orderCreatedAt")::int AS dow,
@@ -262,6 +269,16 @@ export async function buildDashboardStats(userId: string, days: number, storeId?
     point.byStore[row.storeId] = amount;
   }
 
+  const orderTrendPoints = trendPoints.map((point) => ({ date: point.date, total: 0, byStore: {} as Record<string, number> }));
+  for (const row of orderTrendRows) {
+    const key = row.day.toISOString().slice(0, 10);
+    const point = orderTrendPoints.find((entry) => entry.date === key);
+    if (!point) continue;
+    const count = Number(row.count ?? 0);
+    point.total += count;
+    point.byStore[row.storeId] = count;
+  }
+
   const todayKey = new Date().toISOString().slice(0, 10);
   const today = trendPoints.find((point) => point.date === todayKey)?.total ?? 0;
   const last7 = trendPoints.slice(-7).reduce((total, point) => total + point.total, 0);
@@ -306,6 +323,7 @@ export async function buildDashboardStats(userId: string, days: number, storeId?
     },
     windows: { today, last7 },
     trend: { days, points: trendPoints },
+    orderTrend: { days, points: orderTrendPoints },
     statusTrend,
     ordersByGroup,
     stores: stores.map((store) => {
