@@ -20,6 +20,8 @@ import { orderSyncFrequencies, queueStoreOrderSync, startOrderSyncWorker } from 
 import { startProductSyncWorker, queueProductSync, upsertProductsFromOrderItems } from "./lib/product-sync";
 import { normalizeOrder, orderDetailRecord } from "./lib/order-data";
 import { buildDashboardStats, dashboardCsv } from "./lib/dashboard";
+import { ImsError, buildOrderItems, createImsBill, encryptSecret, fetchImsInvoicePdf, getImsConfig, getImsToken, invoiceDateFromResponse, invoiceNumberFromResponse, lookupImsBill, normalizeTracking } from "./lib/ims";
+import { readInvoicePdf, saveInvoicePdf } from "./lib/invoice-storage";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -645,21 +647,26 @@ api.get("/orders", async (req, res) => {
   if (filters.from && filters.to && filters.from > filters.to) return res.status(400).json({ error: "The start date must be before the end date." });
   if (filters.storeId && !(await ownsStore(filters.storeId, req.auth!.id))) return res.status(404).json({ error: "Store not found." });
   const where = orderWhere(filters, req.auth!.id);
-  const [total, orders] = await Promise.all([
-    db.storeOrder.count({ where }),
-    db.storeOrder.findMany({
-      where,
-      orderBy: [{ [orderSortFields[filters.sortBy]]: filters.sortOrder }, { id: "asc" }],
-      skip: (filters.page - 1) * filters.pageSize,
-      take: filters.pageSize,
-      select: {
-        id: true, storeId: true, darazOrderId: true, customerName: true,
-        orderCreatedAt: true, orderUpdatedAt: true, orderStatus: true, statusGroup: true,
-        deliveryStatus: true, trackingNumber: true, amount: true, itemCount: true, syncedAt: true,
-        store: { select: { label: true, country: true, storeType: true } },
-      },
-    }),
-  ]);
+  const allStores = !filters.storeId;
+  const orders = await db.storeOrder.findMany({
+    where,
+    orderBy: [{ [orderSortFields[filters.sortBy]]: filters.sortOrder }, { id: "asc" }],
+    skip: (filters.page - 1) * filters.pageSize,
+    take: filters.pageSize + (allStores ? 1 : 0),
+    select: {
+      id: true, storeId: true, darazOrderId: true, customerName: true,
+      orderCreatedAt: true, orderUpdatedAt: true, orderStatus: true, statusGroup: true,
+      deliveryStatus: true, trackingNumber: true, amount: true, itemCount: true, syncedAt: true,
+      store: { select: { label: true, country: true, storeType: true } },
+    },
+  });
+  // Counting every store is expensive and unnecessary for the "All stores" queue; only
+  // exact counts (pagination totals) are computed once a store is selected.
+  if (allStores) {
+    const hasNext = orders.length > filters.pageSize;
+    return res.json({ orders: orders.slice(0, filters.pageSize), page: filters.page, pageSize: filters.pageSize, total: null, totalPages: null, hasNext });
+  }
+  const total = await db.storeOrder.count({ where });
   return res.json({ orders, page: filters.page, pageSize: filters.pageSize, total, totalPages: Math.ceil(total / filters.pageSize) });
 });
 api.get("/orders/summary", async (req, res) => {
@@ -961,6 +968,285 @@ api.patch("/admin/users/:id", requireAdmin, async (req, res) => {
   if (parsed.data.isActive === false || parsed.data.password) await db.session.deleteMany({ where: { userId: user.id } });
   return res.json(user);
 });
+const imsSettingsInput = z.object({
+  baseUrl: z.string().url().max(300),
+  companyId: z.string().trim().min(1).max(100),
+  branchCode: z.string().trim().min(1).max(20),
+  imsUser: z.string().trim().min(1).max(100),
+  warehouse: z.string().trim().min(1).max(100),
+  paymentMode: z.string().trim().min(1).max(40),
+  voucherType: z.enum(["TI", "SI"]),
+  apiKey: z.string().trim().max(300).optional(),
+  username: z.string().trim().max(200).optional(),
+  password: z.string().max(300).optional(),
+  apiSecret: z.string().max(300).optional(),
+});
+
+async function canAccessInvoice(invoiceId: string, userId: string, role: string) {
+  const invoice = await db.imsInvoice.findUnique({
+    where: { id: invoiceId },
+    include: { orders: { include: { order: { select: { darazOrderId: true, trackingNumber: true, store: { select: { label: true, userId: true } } } } } } },
+  });
+  if (!invoice) return null;
+  if (role === "admin") return invoice;
+  if (!invoice.orders.some((link) => link.order.store.userId === userId)) return null;
+  return invoice;
+}
+
+async function attachInvoicePdf(invoiceId: string, config: Awaited<ReturnType<typeof getImsConfig>>) {
+  const invoice = await db.imsInvoice.findUniqueOrThrow({ where: { id: invoiceId } });
+  if (!invoice.imsInvoiceNumber) throw new ImsError("Invoice number is missing.", "invoice_number_missing");
+  const pdf = await fetchImsInvoicePdf(config, invoice.imsInvoiceNumber);
+  const pdfPath = await saveInvoicePdf(invoice.trackingNumber, pdf, invoice.generatedAt ?? new Date());
+  return db.imsInvoice.update({
+    where: { id: invoiceId },
+    data: { pdfPath, status: "generated", error: null, verifiedAt: new Date() },
+  });
+}
+
+api.get("/admin/ims/settings", requireAdmin, async (_req, res) => {
+  const setting = await db.imsSetting.findUnique({ where: { id: "default" } });
+  if (!setting) return res.json({ configured: false });
+  return res.json({
+    configured: true,
+    baseUrl: setting.baseUrl,
+    companyId: setting.companyId,
+    branchCode: setting.branchCode,
+    imsUser: setting.imsUser,
+    warehouse: setting.warehouse,
+    paymentMode: setting.paymentMode,
+    voucherType: setting.voucherType,
+    hasApiKey: Boolean(setting.apiKeyEnc),
+    hasUsername: Boolean(setting.usernameEnc),
+    hasPassword: Boolean(setting.passwordEnc),
+    hasApiSecret: Boolean(setting.apiSecretEnc),
+    lastTestedAt: setting.lastTestedAt,
+    lastSuccessAt: setting.lastSuccessAt,
+    lastError: setting.lastError,
+  });
+});
+
+api.put("/admin/ims/settings", requireAdmin, async (req, res) => {
+  const parsed = imsSettingsInput.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Provide valid IMS settings." });
+  const input = parsed.data;
+  const existing = await db.imsSetting.findUnique({ where: { id: "default" } });
+  const apiKeyEnc = input.apiKey ? encryptSecret(input.apiKey) : existing?.apiKeyEnc;
+  if (!apiKeyEnc) return res.status(400).json({ error: "API key is required." });
+  const setting = await db.imsSetting.upsert({
+    where: { id: "default" },
+    create: {
+      id: "default", baseUrl: input.baseUrl, companyId: input.companyId, branchCode: input.branchCode,
+      imsUser: input.imsUser, warehouse: input.warehouse, paymentMode: input.paymentMode, voucherType: input.voucherType,
+      apiKeyEnc, usernameEnc: encryptSecret(input.username), passwordEnc: encryptSecret(input.password), apiSecretEnc: encryptSecret(input.apiSecret),
+    },
+    update: {
+      baseUrl: input.baseUrl, companyId: input.companyId, branchCode: input.branchCode,
+      imsUser: input.imsUser, warehouse: input.warehouse, paymentMode: input.paymentMode, voucherType: input.voucherType,
+      ...(input.apiKey ? { apiKeyEnc } : {}),
+      ...(input.username !== undefined ? { usernameEnc: encryptSecret(input.username) } : {}),
+      ...(input.password !== undefined ? { passwordEnc: encryptSecret(input.password) } : {}),
+      ...(input.apiSecret !== undefined ? { apiSecretEnc: encryptSecret(input.apiSecret) } : {}),
+      lastError: null,
+    },
+  });
+  await audit("ims_settings_updated", req.auth!.id, undefined);
+  return res.json({ saved: true, configured: true, lastSuccessAt: setting.lastSuccessAt, lastError: setting.lastError });
+});
+
+api.post("/admin/ims/test", requireAdmin, async (req, res) => {
+  try {
+    const ims = await getImsConfig();
+    await getImsToken(ims);
+    const now = new Date();
+    await db.imsSetting.update({ where: { id: "default" }, data: { lastTestedAt: now, lastSuccessAt: now, lastError: null } });
+    await audit("ims_connection_tested", req.auth!.id, undefined, { ok: true });
+    return res.json({ ok: true, testedAt: now });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "IMS connection failed.";
+    await db.imsSetting.updateMany({ where: { id: "default" }, data: { lastTestedAt: new Date(), lastError: message.slice(0, 500) } });
+    await audit("ims_connection_tested", req.auth!.id, undefined, { ok: false, reason: message.slice(0, 300) });
+    return res.status(502).json({ error: message });
+  }
+});
+
+api.get("/ims/invoices", async (req, res) => {
+  const query = z.object({ q: z.string().trim().max(120).optional(), status: z.string().max(40).optional(), from: z.coerce.date().optional(), to: z.coerce.date().optional() }).safeParse(req.query);
+  if (!query.success) return res.status(400).json({ error: "Invalid invoice filters." });
+  const { q, status, from, to } = query.data;
+  const where: Prisma.ImsInvoiceWhereInput = {
+    ...(status ? { status } : {}),
+    ...(from || to ? { generatedAt: { ...(from ? { gte: from } : {}), ...(to ? { lt: new Date(to.getTime() + 86_400_000) } : {}) } } : {}),
+    ...(q ? { OR: [{ trackingNumber: { contains: q, mode: "insensitive" } }, { imsInvoiceNumber: { contains: q, mode: "insensitive" } }, { orders: { some: { order: { darazOrderId: { contains: q, mode: "insensitive" } } } } }] } : {}),
+  };
+  if (req.auth!.role !== "admin") where.orders = { some: { order: { store: { userId: req.auth!.id } } } };
+  const [invoices, total, today, pending, failed] = await Promise.all([
+    db.imsInvoice.findMany({ where, orderBy: { createdAt: "desc" }, take: 200, include: { orders: { include: { order: { select: { darazOrderId: true, trackingNumber: true, store: { select: { label: true } } } } } } } }),
+    db.imsInvoice.count({ where }),
+    db.imsInvoice.count({ where: { ...where, generatedAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) } } }),
+    db.imsInvoice.count({ where: { ...where, status: "pending_verification" } }),
+    db.imsInvoice.count({ where: { ...where, status: "failed" } }),
+  ]);
+  return res.json({ invoices, total, summary: { total, today, pending, failed } });
+});
+
+api.get("/ims/invoices/order/:orderId", async (req, res) => {
+  const orderId = typeof req.params.orderId === "string" ? req.params.orderId : "";
+  const order = await db.storeOrder.findFirst({ where: { id: orderId, store: { userId: req.auth!.id, isActive: true } }, include: { imsInvoiceOrders: { include: { invoice: true } } } });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  const invoice = order.imsInvoiceOrders[0]?.invoice;
+  if (!invoice) return res.json({ invoice: null, trackingNumber: order.trackingNumber });
+  return res.json({ invoice, trackingNumber: order.trackingNumber });
+});
+
+api.post("/ims/invoices/generate", async (req, res) => {
+  const parsed = z.object({ orderId: z.string().min(1), confirm: z.literal(true) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Explicit confirmation is required to generate a tax invoice." });
+  const order = await db.storeOrder.findFirst({
+    where: { id: parsed.data.orderId, store: { userId: req.auth!.id, isActive: true } },
+    include: { store: { include: { tokens: true } }, imsInvoiceOrders: { include: { invoice: true } } },
+  });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  if (order.store.storeType === "choice") return res.status(409).json({ error: "Choice seller orders cannot be invoiced here." });
+  const tracking = normalizeTracking(order.trackingNumber);
+  if (!tracking) return res.status(409).json({ error: "This order has no Daraz tracking number yet." });
+  const existingOrderInvoice = order.imsInvoiceOrders[0]?.invoice;
+  if (existingOrderInvoice) return res.json({ invoice: existingOrderInvoice, existing: true });
+  const existing = await db.imsInvoice.findUnique({ where: { trackingNormalized: tracking } });
+  if (existing) {
+    await db.imsInvoiceOrder.upsert({ where: { orderId: order.id }, create: { invoiceId: existing.id, orderId: order.id }, update: { invoiceId: existing.id } });
+    return res.json({ invoice: existing, existing: true });
+  }
+
+  let ims;
+  try { ims = await getImsConfig(); } catch (error) {
+    return res.status(409).json({ error: error instanceof Error ? error.message : "IMS is not configured." });
+  }
+
+  let invoice;
+  try {
+    const actor = await db.user.findUnique({ where: { id: req.auth!.id }, select: { name: true, email: true } });
+    invoice = await db.imsInvoice.create({
+      data: {
+        trackingNumber: order.trackingNumber ?? tracking,
+        trackingNormalized: tracking,
+        status: "generating",
+        generatedById: req.auth!.id,
+        generatedByName: actor?.name ?? actor?.email ?? null,
+      },
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      const raced = await db.imsInvoice.findUnique({ where: { trackingNormalized: tracking } });
+      if (raced) return res.status(409).json({ error: "An invoice already exists for this tracking number.", invoice: raced });
+    }
+    throw error;
+  }
+
+  try {
+    let items = buildOrderItems(order, order.rawDetails);
+    if (!items.length) {
+      const accessToken = await fetchAccessToken(order.store);
+      const body = await fetchDarazOrderItems(order.store.country, accessToken, order.darazOrderId);
+      const fetched = Array.isArray((body as any)?.data) ? (body as any).data : [];
+      items = buildOrderItems(order, { data: { order_items: fetched } });
+    }
+    if (!items.length) throw new ImsError("No invoice line items are available for this order.", "items_missing");
+    const raw = (order.rawDetails as any)?.data ?? order.rawDetails ?? {};
+    const address = raw.address_shipping ?? {};
+
+    let imsNumber: string | null = null;
+    let responseBody: unknown = null;
+    try {
+      const found = await lookupImsBill(ims, tracking);
+      if (found) { imsNumber = found.vchrno; responseBody = found.raw; }
+    } catch { /* lookup is best effort before generation */ }
+
+    if (!imsNumber) {
+      const result = await createImsBill(ims, {
+        trackingNumber: tracking,
+        orderNumber: order.darazOrderId,
+        customerName: order.customerName || `${address.first_name ?? ""} ${address.last_name ?? ""}`.trim() || "Daraz customer",
+        address: [address.address1, address.address2, address.address3, address.city].filter(Boolean).join(", "),
+        mobile: address.phone ?? "",
+        pan: raw.vat_no ?? "",
+        amount: Number(order.amount ?? 0),
+        items,
+        remarks: `Daraz Hub order ${order.darazOrderId}`,
+      });
+      responseBody = result.body;
+      imsNumber = invoiceNumberFromResponse(result.body);
+    }
+
+    if (!imsNumber) {
+      await db.imsInvoice.update({ where: { id: invoice.id }, data: { status: "pending_verification", imsResponse: responseBody ? JSON.parse(JSON.stringify(responseBody)) : undefined, error: "IMS did not return an invoice number. Verify in IMS before trying again." } });
+      return res.status(202).json({ invoice: await db.imsInvoice.findUniqueOrThrow({ where: { id: invoice.id } }), pending: true });
+    }
+
+    const invoiceDate = invoiceDateFromResponse(responseBody) ?? new Date();
+    invoice = await db.imsInvoice.update({
+      where: { id: invoice.id },
+      data: { imsInvoiceNumber: imsNumber, invoiceDate, generatedAt: new Date(), status: "invoice_created", imsResponse: responseBody ? JSON.parse(JSON.stringify(responseBody)) : undefined, error: null },
+    });
+    await db.imsInvoiceOrder.upsert({ where: { orderId: order.id }, create: { invoiceId: invoice.id, orderId: order.id }, update: { invoiceId: invoice.id } });
+
+    let withPdf;
+    try { withPdf = await attachInvoicePdf(invoice.id, ims); }
+    catch (pdfError) {
+      withPdf = await db.imsInvoice.update({ where: { id: invoice.id }, data: { status: "pdf_recovery_required", error: pdfError instanceof Error ? pdfError.message.slice(0, 500) : "PDF download failed." } });
+    }
+    await audit("ims_invoice_generated", req.auth!.id, order.storeId, { trackingNumber: tracking, imsInvoiceNumber: imsNumber, invoiceId: invoice.id });
+    return res.status(201).json({ invoice: withPdf });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "IMS invoice generation failed.";
+    const uncertain = error instanceof ImsError && ["timeout", "network_error"].includes(error.code);
+    if (uncertain) {
+      try {
+        const found = await lookupImsBill(ims, tracking);
+        if (found) {
+          const updated = await db.imsInvoice.update({ where: { id: invoice.id }, data: { imsInvoiceNumber: found.vchrno, generatedAt: new Date(), status: "invoice_created", imsResponse: JSON.parse(JSON.stringify(found.raw ?? {})) } });
+          await db.imsInvoiceOrder.upsert({ where: { orderId: order.id }, create: { invoiceId: updated.id, orderId: order.id }, update: { invoiceId: updated.id } });
+          const withPdf = await attachInvoicePdf(updated.id, ims).catch(async () => db.imsInvoice.update({ where: { id: updated.id }, data: { status: "pdf_recovery_required", error: "IMS invoice exists but PDF retrieval failed." } }));
+          return res.status(201).json({ invoice: withPdf });
+        }
+      } catch { /* verification failed */ }
+    }
+    await db.imsInvoice.update({ where: { id: invoice.id }, data: { status: uncertain ? "pending_verification" : "failed", error: message.slice(0, 500) } });
+    await audit("ims_invoice_failed", req.auth!.id, order.storeId, { trackingNumber: tracking, reason: message.slice(0, 300) });
+    return res.status(502).json({ error: message, invoice: await db.imsInvoice.findUniqueOrThrow({ where: { id: invoice.id } }) });
+  }
+});
+
+api.post("/ims/invoices/:id/recover-pdf", async (req, res) => {
+  const invoice = await canAccessInvoice(typeof req.params.id === "string" ? req.params.id : "", req.auth!.id, req.auth!.role);
+  if (!invoice) return res.status(404).json({ error: "Invoice not found." });
+  if (!invoice.imsInvoiceNumber) return res.status(409).json({ error: "This invoice has no IMS invoice number to recover." });
+  try {
+    const ims = await getImsConfig();
+    const updated = await attachInvoicePdf(invoice.id, ims);
+    await audit("ims_invoice_pdf_recovered", req.auth!.id, invoice.orders[0]?.order.store.userId ?? null, { invoiceId: invoice.id });
+    return res.json({ invoice: updated });
+  } catch (error) {
+    return res.status(502).json({ error: error instanceof Error ? error.message : "PDF recovery failed." });
+  }
+});
+
+api.get("/ims/invoices/:id/pdf", async (req, res) => {
+  const invoice = await canAccessInvoice(typeof req.params.id === "string" ? req.params.id : "", req.auth!.id, req.auth!.role);
+  if (!invoice) return res.status(404).json({ error: "Invoice not found." });
+  if (!invoice.pdfPath) return res.status(409).json({ error: "The invoice PDF is not available. Recover the PDF first." });
+  try {
+    const { pdf } = await readInvoicePdf(invoice.pdfPath);
+    const download = req.query.download === "1";
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `${download ? "attachment" : "inline"}; filename="tax-invoice-${invoice.trackingNormalized.replace(/[^A-Za-z0-9_-]/g, "_")}.pdf"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(pdf);
+  } catch {
+    return res.status(404).json({ error: "Invoice PDF file was not found." });
+  }
+});
+
 api.get("/admin/logs", requireAdmin, async (req, res) => {
   const storeId = typeof req.query.storeId === "string" && req.query.storeId ? req.query.storeId : undefined;
   const stores = await db.store.findMany({

@@ -22,7 +22,7 @@ type Activity = { id: string; action: string; createdAt: string; meta?: { phase?
 type StoreDetails = Store & { activity: Activity[] };
 type StoreTokens = { accessToken: string; refreshToken: string };
 type Summary = { total: number; connected: number; expiringSoon: number; expired: number };
-type Route = { page: "dashboard" | "stores" | "store" | "store-settings" | "orders" | "products" | "admin" | "admin-store" | "admin-logs" | "audit"; storeId?: string };
+type Route = { page: "dashboard" | "stores" | "store" | "store-settings" | "orders" | "products" | "admin" | "admin-store" | "admin-logs" | "audit" | "ims-invoices" | "ims-history" | "ims-settings"; storeId?: string };
 
 const NAV_STORAGE_KEY = "daraz-hub-sidebar";
 
@@ -44,6 +44,9 @@ function routeFor(pathname: string): Route {
   const adminStore = pathname.match(/^\/admin\/stores\/([^/]+)/);
   if (adminStore) return { page: "admin-store", storeId: adminStore[1] };
   if (pathname.startsWith("/admin/logs")) return { page: "admin-logs" };
+  if (pathname.startsWith("/ims/settings")) return { page: "ims-settings" };
+  if (pathname.startsWith("/ims/history")) return { page: "ims-history" };
+  if (pathname.startsWith("/ims")) return { page: "ims-invoices" };
   if (pathname.startsWith("/admin")) return { page: "admin" };
   if (pathname.startsWith("/audit")) return { page: "audit" };
   if (pathname.startsWith("/orders")) return { page: "orders" };
@@ -56,9 +59,22 @@ function routeFor(pathname: string): Route {
   return { page: "dashboard" };
 }
 const pathFor = (route: Route) =>
-  route.page === "store" ? `/stores/${route.storeId}` : route.page === "store-settings" ? `/stores/${route.storeId}/settings` : route.page === "admin-store" ? `/admin/stores/${route.storeId}` : route.page === "dashboard" ? "/" : route.page === "admin-logs" ? "/admin/logs" : `/${route.page}`;
+  route.page === "store" ? `/stores/${route.storeId}` : route.page === "store-settings" ? `/stores/${route.storeId}/settings` : route.page === "admin-store" ? `/admin/stores/${route.storeId}` : route.page === "dashboard" ? "/" : route.page === "admin-logs" ? "/admin/logs" : route.page === "ims-invoices" ? "/ims/invoices" : route.page === "ims-history" ? "/ims/history" : route.page === "ims-settings" ? "/ims/settings" : `/${route.page}`;
 const titleFor = (route: Route) =>
-  ({ dashboard: "Overview", stores: "My stores", store: "Store details", "store-settings": "Store settings", orders: "Order management", products: "Product catalog", admin: "Administration", "admin-store": "Store details", "admin-logs": "Store logs", audit: "Audit log" })[route.page];
+  ({ dashboard: "Overview", stores: "My stores", store: "Store details", "store-settings": "Store settings", orders: "Order management", products: "Product catalog", admin: "Administration", "admin-store": "Store details", "admin-logs": "Store logs", audit: "Audit log", "ims-invoices": "Invoice Management", "ims-history": "Invoice History", "ims-settings": "IMS Settings" })[route.page];
+
+function NavIcon({ name }: { name: string }) {
+  const paths: Record<string, ReactNode> = {
+    overview: <><rect x="3" y="3" width="7" height="7" rx="1.6" /><rect x="14" y="3" width="7" height="7" rx="1.6" /><rect x="3" y="14" width="7" height="7" rx="1.6" /><rect x="14" y="14" width="7" height="7" rx="1.6" /></>,
+    orders: <><path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3z" /><path d="M9 8h6M9 12h6" /></>,
+    products: <><path d="M21 8l-9-5-9 5 9 5 9-5z" /><path d="M3 8v8l9 5 9-5V8" /></>,
+    stores: <><path d="M4 9h16l-1 11H5L4 9z" /><path d="M8 9V6a4 4 0 018 0v3" /></>,
+    users: <><circle cx="9" cy="8" r="3" /><path d="M3 20c0-3 3-5 6-5s6 2 6 5" /><circle cx="17" cy="9" r="2" /><path d="M17 14c2 0 4 1 4 3" /></>,
+    logs: <><path d="M5 5h14M5 12h14M5 19h9" /></>,
+    audit: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+  };
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
+}
 
 export default function App() {
   const [token, setToken] = useState("");
@@ -195,13 +211,26 @@ export default function App() {
 
   const isAdminPage = page === "admin" || page === "admin-store" || page === "admin-logs";
   return <div className={navOpen ? "app-shell" : "app-shell nav-collapsed"}>
-    <aside className="sidebar" id="app-sidebar" inert={!navOpen}><a className="logo" href="/" onClick={(e) => { e.preventDefault(); navigate({ page: "dashboard" }); }}><span className="brand-mark small">D</span><span>Daraz<span className="muted"> Hub</span></span></a>
-      <div className="nav-caption">WORKSPACE</div>
-      <button className={page === "dashboard" ? "nav active" : "nav"} onClick={() => navigate({ page: "dashboard" })}>◫ &nbsp;Overview</button>
-      <button className={page === "stores" || page === "store" ? "nav active" : "nav"} onClick={() => navigate({ page: "stores" })}>▤ &nbsp;My stores</button>
-      <button className={page === "orders" ? "nav active" : "nav"} onClick={() => navigate({ page: "orders" })}>▣ &nbsp;Orders</button>
-      <button className={page === "products" ? "nav active" : "nav"} onClick={() => navigate({ page: "products" })}>▦ &nbsp;Products</button>
-      {user.role === "admin" && <><div className="nav-caption">ADMINISTRATION</div><button className={page === "admin" ? "nav active" : "nav"} onClick={() => navigate({ page: "admin" })}>♙ &nbsp;Users & stores</button><button className={page === "admin-logs" ? "nav active" : "nav"} onClick={() => navigate({ page: "admin-logs" })}>≡ &nbsp;Store logs</button><button className={page === "audit" ? "nav active" : "nav"} onClick={() => navigate({ page: "audit" })}>◷ &nbsp;Audit log</button></>}
+    <aside className="sidebar" id="app-sidebar" inert={!navOpen}><a className="logo" href="/" onClick={(e) => { e.preventDefault(); navigate({ page: "dashboard" }); }}><span className="brand-mark small">D</span><span className="brand-text"><strong>Daraz</strong><span>Store Hub</span></span></a>
+      <div className="nav-items">
+        <button className={page === "dashboard" ? "nav active" : "nav"} onClick={() => navigate({ page: "dashboard" })}><NavIcon name="overview" /><span>Overview</span></button>
+        <button className={page === "orders" ? "nav active" : "nav"} onClick={() => navigate({ page: "orders" })}><NavIcon name="orders" /><span>Orders</span></button>
+        <button className={page === "products" ? "nav active" : "nav"} onClick={() => navigate({ page: "products" })}><NavIcon name="products" /><span>Products</span></button>
+        <button className={page === "stores" || page === "store" ? "nav active" : "nav"} onClick={() => navigate({ page: "stores" })}><NavIcon name="stores" /><span>My stores</span></button>
+      </div>
+      {user.role === "admin" && <><div className="nav-divider" /><div className="nav-items">
+        <button className={page === "admin" ? "nav active" : "nav"} onClick={() => navigate({ page: "admin" })}><NavIcon name="users" /><span>Users & stores</span></button>
+        <button className={page === "admin-logs" ? "nav active" : "nav"} onClick={() => navigate({ page: "admin-logs" })}><NavIcon name="logs" /><span>Store logs</span></button>
+        <button className={page === "audit" ? "nav active" : "nav"} onClick={() => navigate({ page: "audit" })}><NavIcon name="audit" /><span>Audit log</span></button>
+      </div></>}
+      <div className="nav-divider" />
+      <div className="nav-caption">IMS</div>
+      <div className="nav-items">
+        <button className={page === "ims-invoices" ? "nav active" : "nav"} onClick={() => navigate({ page: "ims-invoices" })}><NavIcon name="orders" /><span>Invoice Management</span></button>
+        <button className={page === "ims-history" ? "nav active" : "nav"} onClick={() => navigate({ page: "ims-history" })}><NavIcon name="logs" /><span>Invoice History</span></button>
+        {user.role === "admin" && <button className={page === "ims-settings" ? "nav active" : "nav"} onClick={() => navigate({ page: "ims-settings" })}><NavIcon name="audit" /><span>IMS Settings</span></button>}
+      </div>
+      <div className="sidebar-language"><span className="globe">◎</span> English</div>
       <div className="profile"><span className="avatar">{user.name[0]?.toUpperCase()}</span><div className="profile-text"><strong>{user.name}</strong><small>{user.email}</small></div><button className="icon-button" aria-label="Sign out" onClick={logout}>↗</button></div>
     </aside>
     <main className="main">
@@ -216,6 +245,9 @@ export default function App() {
       : page === "admin-store" ? <StoreDetail key={route.storeId} token={token} storeId={route.storeId!} admin onBack={() => navigate({ page: "admin" })} onNotice={setNotice} />
       : page === "orders" ? <Orders token={token} stores={stores} />
       : page === "products" ? <Products token={token} stores={stores} />
+      : page === "ims-invoices" ? <ImsInvoices token={token} />
+      : page === "ims-history" ? <ImsInvoices token={token} history />
+      : page === "ims-settings" ? <ImsSettings token={token} />
       : page === "admin-logs" ? <AdminLogs token={token} /> : page === "admin" ? <Admin token={token} onOpenStore={(store) => navigate({ page: "admin-store", storeId: store.id })} /> : <Audit token={token} />}
       <footer>Daraz Store Hub <span>Tokens are encrypted at rest and revealed only on request.</span></footer>
     </main>
@@ -1079,8 +1111,9 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
   const [summary, setSummary] = useState<OrderSummary | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
-  const [total, setTotal] = useState(0);
+  const [total, setTotal] = useState<number | null>(null);
   const [totalPages, setTotalPages] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
   const [storeId, setStoreId] = useState("");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -1092,6 +1125,11 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<OrderRow | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [moreMenu, setMoreMenu] = useState<string | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [actionNotice, setActionNotice] = useState("");
+  const [noteVersion, setNoteVersion] = useState(0);
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
@@ -1119,22 +1157,33 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
 
     let current = true;
     setLoading(true);
-    Promise.all([api(`/orders?${list}`, token), api(`/orders/summary?${filters}`, token)])
-      .then(([data, summaryData]) => {
+    api(`/orders?${list}`, token)
+      .then((data) => {
         if (!current) return;
         setRows(data.orders);
         setTotal(data.total);
-        setTotalPages(data.totalPages);
-        setSummary(summaryData);
+        setTotalPages(data.totalPages ?? 0);
+        setHasNext(Boolean(data.hasNext) || (typeof data.total === "number" && data.page < data.totalPages));
         setError("");
+        setLoading(false);
       })
-      .catch((e) => { if (current) setError(e instanceof Error ? e.message : "Unable to load orders."); })
-      .finally(() => { if (current) setLoading(false); });
+      .catch((e) => {
+        if (!current) return;
+        setError(e instanceof Error ? e.message : "Unable to load orders.");
+        setLoading(false);
+      });
+    api(`/orders/summary?${filters}`, token)
+      .then((summaryData) => { if (current) setSummary(summaryData); })
+      .catch(() => { if (current) setSummary({ groups: {} }); });
     return () => { current = false; };
   }, [token, page, pageSize, storeId, debouncedSearch, from, to, sortBy, sortOrder, statusGroup, orderStatus, reloadKey]);
 
   const counts = summary?.groups ?? {};
-  const pageText = total === 0 ? "0 orders" : `${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, total)} of ${total.toLocaleString()}`;
+  const pageText = total === null
+    ? `${rows.length} orders on this page`
+    : total === 0
+      ? "0 orders"
+      : `${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, total)} of ${total.toLocaleString()}`;
 
   async function exportCsv() {
     const filters = new URLSearchParams();
@@ -1159,10 +1208,105 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
     }
   }
 
+  const selectedOrders = rows.filter((order) => selectedIds.has(order.id));
+  const escapeHtml = (value: unknown) => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  const canFulfil = (order: OrderRow) => order.store.storeType !== "choice" && !["canceled", "delivered", "returned", "failed_delivery"].includes(order.statusGroup ?? "");
+
+  async function orderDetail(order: OrderRow): Promise<any> {
+    try {
+      return await api(`/orders/${order.id}`, token);
+    } catch {
+      return null;
+    }
+  }
+
+  async function printOrders(orders: OrderRow[], kind: "picklist" | "invoice") {
+    if (!orders.length) return;
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setActionNotice("Allow pop-ups to print picklists/invoices.");
+      return;
+    }
+    printWindow.document.write("<p style='font-family:sans-serif;padding:24px'>Preparing printout…</p>");
+    const blocks: string[] = [];
+    for (const order of orders) {
+      const detail = await orderDetail(order);
+      const data = detail?.rawDetails?.data ?? {};
+      const items: any[] = Array.isArray(data.order_items) ? data.order_items : [];
+      const address = data.address_shipping ?? {};
+      const rowsHtml = items.length
+        ? items.map((item) => `<tr><td>${escapeHtml(item.name ?? item.shop_sku ?? item.sku)}<br><small>SKU ${escapeHtml(item.shop_sku ?? item.sku ?? "—")}</small></td><td>${escapeHtml(item.quantity ?? 1)}</td><td>${escapeHtml(formatMoney(item.paid_price))}</td></tr>`).join("")
+        : `<tr><td colspan="3">No cached line items</td></tr>`;
+      blocks.push(`<section class="block">
+        <header><strong>${kind === "picklist" ? "PICKLIST" : "INVOICE"}</strong><span>${escapeHtml(order.store.label)} · ${escapeHtml(order.darazOrderId)}</span></header>
+        <div class="meta"><div><b>Customer</b><br>${escapeHtml(order.customerName ?? "—")}</div><div><b>Created</b><br>${escapeHtml(dateLabel(order.orderCreatedAt))}</div><div><b>Amount</b><br>${escapeHtml(formatMoney(order.amount))}</div><div><b>Tracking</b><br>${escapeHtml(order.trackingNumber ?? "—")}</div></div>
+        <table><thead><tr><th>Item</th><th>Qty</th><th>Price</th></tr></thead><tbody>${rowsHtml}</tbody></table>
+        <address>${escapeHtml([address.address1, address.address2, address.address3, address.city, address.country].filter(Boolean).join(", ") || "—")}<br>${escapeHtml(address.phone ?? "")}</address>
+      </section>`);
+    }
+    printWindow.document.open();
+    printWindow.document.write(`<!doctype html><html><head><title>${kind === "picklist" ? "Picklist" : "Invoice"}</title><style>
+      body{font-family:Roboto,Arial,sans-serif;color:#20252d;padding:24px;font-size:12px}
+      .block{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:16px;page-break-inside:avoid}
+      header{display:flex;justify-content:space-between;border-bottom:1px solid #eee;padding-bottom:8px;margin-bottom:10px}
+      .meta{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}
+      table{width:100%;border-collapse:collapse;margin-bottom:8px}
+      th,td{text-align:left;border-bottom:1px solid #eee;padding:6px}
+      address{color:#555;font-style:normal}
+    </style></head><body>${blocks.join("")}</body></html>`);
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+  }
+
+  async function packAndPrint(order: OrderRow) {
+    if (!canFulfil(order)) {
+      setActionNotice(`Order ${order.darazOrderId} cannot be packed in its current state.`);
+      return;
+    }
+    setBulkBusy(true);
+    setActionNotice(`Packing ${order.darazOrderId}…`);
+    try {
+      const detail = await orderDetail(order);
+      const items: any[] = Array.isArray(detail?.rawDetails?.data?.order_items) ? detail.rawDetails.data.order_items : [];
+      const hasPackage = items.some((item) => item.package_id) || Boolean(order.trackingNumber);
+      if (!hasPackage) await api(`/orders/${order.id}/package`, token, { method: "POST" });
+      const awb = await api(`/orders/${order.id}/awb`, token);
+      if (awb.pdfUrl) window.open(awb.pdfUrl, "_blank", "noopener,noreferrer");
+      setActionNotice(hasPackage ? `AWB opened for ${order.darazOrderId}.` : `Package created and AWB opened for ${order.darazOrderId}.`);
+      setReloadKey((key) => key + 1);
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "Pack & Print failed.");
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function bulkPackAndPrint() {
+    for (const order of selectedOrders) {
+      if (!canFulfil(order)) continue;
+      await packAndPrint(order);
+    }
+  }
+
+  function sellerNote(order: OrderRow) {
+    const key = `daraz-hub-note:${order.id}`;
+    const next = prompt(`Seller note for ${order.darazOrderId}`, localStorage.getItem(key) ?? "");
+    if (next === null) return;
+    if (next.trim()) localStorage.setItem(key, next.trim());
+    else localStorage.removeItem(key);
+    setNoteVersion((value) => value + 1);
+    setMoreMenu(null);
+  }
+
+  function toggleAll() {
+    setSelectedIds(selectedIds.size === rows.length ? new Set() : new Set(rows.map((order) => order.id)));
+  }
+
   return <>
     <section className="panel">
       <div className="section-head">
-        <div><h2>Orders {storeId && <span className="count">{total.toLocaleString()}</span>}</h2><p className="muted">All connected stores in one queue, with the same status lanes as Seller Center.</p></div>
+        <div><h2>Orders {storeId && total !== null && <span className="count">{total.toLocaleString()}</span>}</h2><p className="muted">All connected stores in one queue, with the same status lanes as Seller Center.</p></div>
         <div className="head-actions">
           <button className="secondary" disabled={loading} onClick={() => setReloadKey((key) => key + 1)}>Refresh</button>
           <button className="secondary" onClick={() => void exportCsv()}>Export CSV</button>
@@ -1206,21 +1350,62 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
       </div>
 
       {error && <p className="notice error">{error}</p>}
-      <div className="table-wrap orders-table"><table>
-        <thead><tr><th>Order</th><th>Store</th><th>Customer</th><th>Items</th><th>Amount</th><th>Status</th><th>Delivery</th><th>Tracking</th></tr></thead>
-        <tbody>{rows.map((order) => <tr key={order.id} className="order-row" onClick={() => setSelected(order)}>
-          <td><button className="link-button order-id" onClick={(event) => { event.stopPropagation(); setSelected(order); }}>{order.darazOrderId}</button><small>{dateLabel(order.orderCreatedAt)}</small></td>
-          <td>{order.store.label}</td>
-          <td>{order.customerName ?? "—"}</td>
-          <td>{order.itemCount ?? "—"}</td>
-          <td className="money">{formatMoney(order.amount)}</td>
-          <td><OrderStatusBadge order={order} /></td>
-          <td>{order.deliveryStatus ?? "—"}</td>
-          <td>{order.trackingNumber ?? "—"}</td>
-        </tr>)}
-        {!loading && rows.length === 0 && <tr><td colSpan={8} className="orders-empty">No orders in this lane yet. Check the store's sync settings, then run a sync.</td></tr>}
-        {loading && <tr><td colSpan={8} className="orders-empty">Loading orders…</td></tr>}
-        </tbody></table></div>
+      {actionNotice && <p className="notice">{actionNotice}</p>}
+
+      {selectedIds.size > 0 && <div className="bulk-bar">
+        <span className="bulk-count">Selected {selectedIds.size} items</span>
+        <button className="primary" disabled={bulkBusy} onClick={() => void bulkPackAndPrint()}>{bulkBusy ? "Working…" : "Pack & Print"}</button>
+        <button className="secondary" onClick={() => void printOrders(selectedOrders, "picklist")}>Print PickList</button>
+        <button className="secondary" onClick={() => void printOrders(selectedOrders, "invoice")}>Print Invoices</button>
+        <button className="text-button" onClick={() => setSelectedIds(new Set())}>Clear</button>
+      </div>}
+
+      <div className="order-list-head">
+        <label><input type="checkbox" checked={rows.length > 0 && selectedIds.size === rows.length} onChange={toggleAll} /> Select page</label>
+        <span className="muted">{pageText}</span>
+      </div>
+
+      <div className="order-cards">
+        {rows.map((order) => {
+          const note = localStorage.getItem(`daraz-hub-note:${order.id}`) ?? "";
+          const ageHours = Math.max(0, Math.round((Date.now() - new Date(order.orderCreatedAt).getTime()) / 3_600_000));
+          return <article key={`${order.id}-${noteVersion}`} className={selectedIds.has(order.id) ? "order-card selected" : "order-card"}>
+            <div className="order-card-head">
+              <input type="checkbox" checked={selectedIds.has(order.id)} onChange={() => setSelectedIds((previous) => {
+                const next = new Set(previous);
+                if (next.has(order.id)) next.delete(order.id); else next.add(order.id);
+                return next;
+              })} aria-label={`Select order ${order.darazOrderId}`} />
+              <div className="order-customer"><strong>{order.customerName ?? "—"}</strong><span>{order.itemCount ?? 0} item(s) · {order.store.label}</span></div>
+              <div className="order-card-meta"><span>Order <b>{order.darazOrderId}</b></span><span>{dateLabel(order.orderCreatedAt)}</span></div>
+            </div>
+            <div className="order-card-body">
+              <div><span>Amount</span><strong>{formatMoney(order.amount)}</strong></div>
+              <div><span>Delivery</span><strong>{order.deliveryStatus ?? "—"}</strong></div>
+              <div><span>Status</span><OrderStatusBadge order={order} /></div>
+              <div><span>Age</span><strong>{ageHours} hrs</strong></div>
+              <div><span>Tracking</span><strong>{order.trackingNumber ?? "—"}</strong></div>
+            </div>
+            {note && <p className="order-note">Note: {note}</p>}
+            <div className="order-card-actions">
+              <button className="primary" disabled={bulkBusy || !canFulfil(order)} onClick={() => void packAndPrint(order)}>Pack &amp; Print</button>
+              <button className="secondary" onClick={() => setSelected(order)}>Details</button>
+              <div className="more-wrap">
+                <button className="secondary" onClick={() => setMoreMenu(moreMenu === order.id ? null : order.id)}>More Actions ▾</button>
+                {moreMenu === order.id && <div className="more-menu">
+                  <button onClick={() => { setMoreMenu(null); void printOrders([order], "picklist"); }}>Print PickList</button>
+                  <button onClick={() => { setMoreMenu(null); void printOrders([order], "invoice"); }}>Print Invoice</button>
+                  <button onClick={() => sellerNote(order)}>Seller Note</button>
+                  <button disabled title="Daraz does not expose seller cancellation through the API">Cancel Order</button>
+                  <button disabled title="Not available through the Daraz API">Request Extension</button>
+                </div>}
+              </div>
+            </div>
+          </article>;
+        })}
+        {!loading && rows.length === 0 && <div className="orders-empty">No orders in this lane yet. Check the store's sync settings, then run a sync.</div>}
+        {loading && <div className="orders-empty">Loading orders…</div>}
+      </div>
       <div className="pagination"><span>{pageText}</span><div><button className="secondary" disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {Math.max(totalPages, 1)}</span><button className="secondary" disabled={page >= totalPages || loading} onClick={() => setPage(page + 1)}>Next</button></div></div>
     </section>
     {selected && <OrderDrawer token={token} order={selected} onClose={() => setSelected(null)} />}
@@ -1364,6 +1549,7 @@ function OrderDrawer({ token, order, onClose }: { token: string; order: OrderRow
           {awbError && <p className="notice error">{awbError}</p>}
           {actionNotice && <p className="notice">{actionNotice}</p>}
           {actionError && <p className="notice error">{actionError}</p>}
+          {!isChoice && <OrderInvoice token={token} order={order} />}
           {showRaw && <pre className="drawer-raw">{JSON.stringify(detail?.rawDetails ?? {}, null, 2)}</pre>}
         </>}
       </div>
@@ -1586,6 +1772,179 @@ type AdminLogsData = {
   jobs: AdminLogJob[];
   logs: Array<{ id: string; action: string; createdAt: string; userEmail: string | null; storeLabel: string | null; meta: any }>;
 };
+
+async function imsPdf(token: string, invoiceId: string, download: boolean) {
+  const response = await fetch(`/api/ims/invoices/${invoiceId}/pdf?download=${download ? "1" : "0"}`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Unable to open invoice PDF.");
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  if (download) {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "ims-tax-invoice.pdf";
+    anchor.click();
+  } else {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function OrderInvoice({ token, order }: { token: string; order: OrderRow }) {
+  const [invoice, setInvoice] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    try {
+      const data = await api(`/ims/invoices/order/${order.id}`, token);
+      setInvoice(data.invoice);
+      setError("");
+    } catch (e) { setError(e instanceof Error ? e.message : "Unable to load invoice."); }
+    finally { setLoading(false); }
+  }, [order.id, token]);
+  useEffect(() => { void load(); }, [load]);
+  async function generate() {
+    if (!confirm(`Generate an IMS tax invoice?\n\nOrder: ${order.darazOrderId}\nTracking: ${order.trackingNumber ?? "—"}\nCustomer: ${order.customerName ?? "—"}\nAmount: ${formatMoney(order.amount)}\n\nThis creates the official IMS invoice and cannot be undone.`)) return;
+    setBusy(true); setError("");
+    try {
+      const result = await api("/ims/invoices/generate", token, { method: "POST", body: JSON.stringify({ orderId: order.id, confirm: true }) });
+      setInvoice(result.invoice);
+      if (result.invoice?.pdfPath) await imsPdf(token, result.invoice.id, false).catch(() => {});
+    } catch (e) { setError(e instanceof Error ? e.message : "Invoice generation failed."); await load(); }
+    finally { setBusy(false); }
+  }
+  async function recover() {
+    if (!invoice) return;
+    setBusy(true);
+    try {
+      const result = await api(`/ims/invoices/${invoice.id}/recover-pdf`, token, { method: "POST" });
+      setInvoice(result.invoice);
+    } catch (e) { setError(e instanceof Error ? e.message : "PDF recovery failed."); }
+    finally { setBusy(false); }
+  }
+  if (loading) return <p className="muted">Loading tax invoice…</p>;
+  return <section className="order-invoice">
+    <h3>Tax Invoice</h3>
+    {error && <p className="notice error">{error}</p>}
+    {invoice ? <>
+      <div className="drawer-grid">
+        <div><span>IMS Invoice No.</span><strong>{invoice.imsInvoiceNumber ?? "Pending verification"}</strong></div>
+        <div><span>Invoice date</span><strong>{invoice.invoiceDate ? dateLabel(invoice.invoiceDate) : "—"}</strong></div>
+        <div><span>Generated</span><strong>{invoice.generatedAt ? dateLabel(invoice.generatedAt) : "—"}</strong></div>
+        <div><span>Generated by</span><strong>{invoice.generatedByName ?? "—"}</strong></div>
+        <div><span>Tracking</span><strong>{invoice.trackingNumber}</strong></div>
+        <div><span>Status</span><strong>{String(invoice.status).replaceAll("_", " ")}</strong></div>
+      </div>
+      {invoice.error && <p className="muted">{invoice.error}</p>}
+      <div className="drawer-actions">
+        {invoice.pdfPath && <>
+          <button className="secondary" onClick={() => void imsPdf(token, invoice.id, false)}>View Invoice</button>
+          <button className="secondary" onClick={() => void imsPdf(token, invoice.id, true)}>Download PDF</button>
+          <button className="secondary" onClick={() => void imsPdf(token, invoice.id, false)}>Print Tax Invoice</button>
+        </>}
+        {invoice.status === "pdf_recovery_required" && <button className="secondary" disabled={busy} onClick={() => void recover()}>{busy ? "Recovering…" : "Recover PDF"}</button>}
+      </div>
+    </> : <div className="drawer-actions">
+      <button className="primary" disabled={busy || !order.trackingNumber} onClick={() => void generate()}>{busy ? "Generating…" : "Generate & Print Tax Invoice"}</button>
+      {!order.trackingNumber && <span className="muted">Tracking number required.</span>}
+    </div>}
+  </section>;
+}
+
+function ImsInvoices({ token, history = false }: { token: string; history?: boolean }) {
+  const [data, setData] = useState<any>(null);
+  const [q, setQ] = useState("");
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    try { setData(await api(`/ims/invoices?${new URLSearchParams({ ...(q ? { q } : {}), ...(status ? { status } : {}) })}`, token)); setError(""); }
+    catch (e) { setError(e instanceof Error ? e.message : "Unable to load invoices."); }
+  }, [token, q, status]);
+  useEffect(() => { const timer = setTimeout(() => { void load(); }, 250); return () => clearTimeout(timer); }, [load]);
+  return <>
+    <div className="stat-grid">
+      <article className="stat-card"><div className="stat-head"><span>Total invoices</span><span className="stat-icon icon-0">▤</span></div><strong>{data?.summary?.total ?? "—"}</strong><small>all invoice records</small></article>
+      <article className="stat-card"><div className="stat-head"><span>Generated today</span><span className="stat-icon icon-1">✓</span></div><strong>{data?.summary?.today ?? "—"}</strong><small>Asia/Kathmandu</small></article>
+      <article className="stat-card"><div className="stat-head"><span>Pending verification</span><span className="stat-icon icon-2">◷</span></div><strong>{data?.summary?.pending ?? "—"}</strong><small>verify in IMS before retrying</small></article>
+      <article className="stat-card"><div className="stat-head"><span>Failed</span><span className="stat-icon icon-3">!</span></div><strong>{data?.summary?.failed ?? "—"}</strong><small>invoice requests</small></article>
+    </div>
+    <section className="panel">
+      <div className="section-head"><div><h2>{history ? "Invoice History" : "Invoice Management"}</h2><p className="muted">IMS-generated tax invoices; PDFs are private and authenticated.</p></div></div>
+      <div className="order-filters">
+        <label>Search<input value={q} onChange={(event) => setQ(event.target.value)} placeholder="Tracking, IMS invoice or Daraz order" /></label>
+        <label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All</option><option value="generated">Generated</option><option value="pending_verification">Pending verification</option><option value="pdf_recovery_required">PDF recovery required</option><option value="failed">Failed</option></select></label>
+      </div>
+      {error && <p className="notice error">{error}</p>}
+      <div className="table-wrap"><table>
+        <thead><tr><th>IMS Invoice</th><th>Tracking</th><th>Daraz orders</th><th>Invoice date</th><th>Generated</th><th>By</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>{(data?.invoices ?? []).map((invoice: any) => <tr key={invoice.id}>
+          <td>{invoice.imsInvoiceNumber ?? "—"}</td>
+          <td>{invoice.trackingNumber}</td>
+          <td>{invoice.orders.map((link: any) => link.order.darazOrderId).join(", ")}</td>
+          <td>{invoice.invoiceDate ? dateLabel(invoice.invoiceDate) : "—"}</td>
+          <td>{invoice.generatedAt ? dateLabel(invoice.generatedAt) : "—"}</td>
+          <td>{invoice.generatedByName ?? "—"}</td>
+          <td><span className={`badge ${invoice.status === "generated" ? "connected" : invoice.status === "failed" ? "error" : "to_ship"}`}>{String(invoice.status).replaceAll("_", " ")}</span></td>
+          <td><div className="head-actions">
+            {invoice.pdfPath && <>
+              <button className="text-button" onClick={() => void imsPdf(token, invoice.id, false)}>View</button>
+              <button className="text-button" onClick={() => void imsPdf(token, invoice.id, true)}>Download</button>
+              <button className="text-button" onClick={() => void imsPdf(token, invoice.id, false)}>Print</button>
+            </>}
+          </div></td>
+        </tr>)}
+        {data && data.invoices.length === 0 && <tr><td colSpan={8} className="orders-empty">No invoices found.</td></tr>}</tbody>
+      </table></div>
+    </section>
+  </>;
+}
+
+function ImsSettings({ token }: { token: string }) {
+  const [form, setForm] = useState<any>({ baseUrl: "https://ecomapi.imssoftware.com.np", companyId: "", branchCode: "", imsUser: "", warehouse: "Main Warehouse", paymentMode: "cash", voucherType: "TI", apiKey: "" });
+  const [saved, setSaved] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    api("/admin/ims/settings", token).then((data) => {
+      setSaved(data);
+      if (data.configured) setForm((previous: any) => ({ ...previous, ...data, apiKey: "" }));
+    }).catch((e) => setError(e instanceof Error ? e.message : "Unable to load IMS settings."));
+  }, [token]);
+  async function save(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setError(""); setNotice("");
+    try {
+      const payload: any = { baseUrl: form.baseUrl, companyId: form.companyId, branchCode: form.branchCode, imsUser: form.imsUser, warehouse: form.warehouse, paymentMode: form.paymentMode, voucherType: form.voucherType };
+      if (form.apiKey) payload.apiKey = form.apiKey;
+      const result = await api("/admin/ims/settings", token, { method: "PUT", body: JSON.stringify(payload) });
+      setSaved(result); setNotice("IMS settings saved."); setForm((previous: any) => ({ ...previous, apiKey: "" }));
+    } catch (e) { setError(e instanceof Error ? e.message : "Unable to save IMS settings."); }
+    finally { setBusy(false); }
+  }
+  async function test() {
+    setBusy(true); setError(""); setNotice("");
+    try { const result = await api("/admin/ims/test", token, { method: "POST" }); setNotice(`IMS connection OK · ${dateLabel(result.testedAt)}`); }
+    catch (e) { setError(e instanceof Error ? e.message : "IMS connection failed."); }
+    finally { setBusy(false); }
+  }
+  return <section className="panel narrow">
+    <div className="section-head"><div><h2>IMS Settings</h2><p className="muted">Credentials are encrypted at rest and never returned to the browser.</p></div></div>
+    {error && <p className="notice error">{error}</p>}
+    {notice && <p className="notice">{notice}</p>}
+    <form className="form-stack" onSubmit={save}>
+      <label>API Base URL<input required value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} placeholder="https://ecomapi.imssoftware.com.np" /></label>
+      <label>Company ID<input required value={form.companyId} onChange={(event) => setForm({ ...form, companyId: event.target.value })} /></label>
+      <label>Branch code<input required value={form.branchCode} onChange={(event) => setForm({ ...form, branchCode: event.target.value })} placeholder="MMX" /></label>
+      <label>IMS user<input required value={form.imsUser} onChange={(event) => setForm({ ...form, imsUser: event.target.value })} /></label>
+      <label>Warehouse<input required value={form.warehouse} onChange={(event) => setForm({ ...form, warehouse: event.target.value })} /></label>
+      <label>Payment mode<select value={form.paymentMode} onChange={(event) => setForm({ ...form, paymentMode: event.target.value })}><option value="cash">cash</option><option value="credit">credit</option><option value="creditcard">creditcard</option><option value="fonepay">fonepay</option></select></label>
+      <label>Voucher type<select value={form.voucherType} onChange={(event) => setForm({ ...form, voucherType: event.target.value })}><option value="TI">Tax Invoice (TI)</option><option value="SI">Abbreviated Tax Invoice (SI)</option></select></label>
+      <label>API key<input type="password" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} placeholder={saved?.hasApiKey ? "Saved — leave blank to keep" : "Required"} /></label>
+      <div className="head-actions"><button disabled={busy}>Save settings</button><button type="button" className="secondary" disabled={busy} onClick={() => void test()}>Test API connection</button></div>
+    </form>
+    <p className="muted">Last successful connection: {saved?.lastSuccessAt ? dateLabel(saved.lastSuccessAt) : "never"}{saved?.lastError ? ` · Last error: ${saved.lastError}` : ""}</p>
+  </section>;
+}
 
 function AdminLogs({ token }: { token: string }) {
   const [data, setData] = useState<AdminLogsData | null>(null);

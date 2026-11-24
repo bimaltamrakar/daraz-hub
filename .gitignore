@@ -6,3 +6,5 @@ dist
 coverage
 *.log
 docker-compose.yml
+Referances/
+private/

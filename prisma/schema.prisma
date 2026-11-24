@@ -119,6 +119,59 @@ model Store {
   @@index([orderSyncNextAt])
 }
 
+model ImsSetting {
+  id            String    @id @default("default")
+  baseUrl       String    @default("https://ecomapi.imssoftware.com.np/api")
+  companyId     String
+  branchCode    String
+  imsUser       String
+  warehouse     String    @default("Main Warehouse")
+  paymentMode   String    @default("cash")
+  voucherType   String    @default("TI")
+  apiKeyEnc     String?
+  usernameEnc   String?
+  passwordEnc   String?
+  apiSecretEnc  String?
+  tokenEnc      String?
+  tokenExpiresAt DateTime?
+  lastTestedAt  DateTime?
+  lastSuccessAt DateTime?
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model ImsInvoice {
+  id                String    @id @default(cuid())
+  trackingNumber    String
+  trackingNormalized String   @unique
+  imsInvoiceNumber  String?
+  invoiceDate       DateTime?
+  generatedAt       DateTime?
+  generatedById     String?
+  generatedByName   String?
+  pdfPath           String?
+  status            String    @default("pending")
+  imsResponse       Json?
+  error             String?
+  verifiedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  orders            ImsInvoiceOrder[]
+  @@index([imsInvoiceNumber])
+  @@index([status])
+  @@index([generatedAt])
+}
+
+model ImsInvoiceOrder {
+  invoiceId String
+  orderId   String
+  invoice   ImsInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  order     StoreOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  @@id([invoiceId, orderId])
+  @@unique([orderId])
+}
+
 model StoreOrder {
   id             String    @id @default(cuid())
   storeId        String
@@ -137,6 +190,7 @@ model StoreOrder {
   rawDetails     Json
   itemsSyncedAt  DateTime?
   syncedAt       DateTime  @default(now())
+  imsInvoiceOrders ImsInvoiceOrder[]
   store          Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
 
   @@unique([storeId, darazOrderId])
