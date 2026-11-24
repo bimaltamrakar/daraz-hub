@@ -11,6 +11,7 @@ type Store = {
   profile: Record<string, unknown> | null; profileFetchedAt: string | null; profileError: string | null;
   accessExpiresAt: string | null; refreshExpiresAt: string | null; lastRefreshedAt: string | null; lastError: string | null;
   orderSyncFrom: string; orderSyncFrequency: string; orderSyncLastAt: string | null; orderSyncNextAt: string | null; productSyncLastAt: string | null;
+  orderSyncCursor?: string | null;
   orderSyncError: string | null; orderSyncRunning?: boolean;
   productSyncNextAt?: string | null;
   productSyncOffset?: number; productSyncError?: string | null; productSyncRunning?: boolean;
@@ -406,7 +407,7 @@ function StoreSettings({ token, storeId, onBack, onNotice }: { token: string; st
 
     <section className="panel">
       <h2>Order sync schedule</h2>
-      <p className="muted">Choose how far back Daraz orders are imported for this store and how often the worker checks for changes. Only this store is affected.</p>
+      <p className="muted">Choose how far back Daraz orders are imported for this store and how often the worker checks for changes. Scheduled runs fetch orders <strong>updated since the last update cursor</strong> (minus one minute) so statuses and tracking changes stay current.</p>
       <form className="sync-settings" onSubmit={saveSettings}>
         <label>Sync orders from<input required type="date" name="fromDate" max={new Date().toISOString().slice(0, 10)} defaultValue={store.orderSyncFrom?.slice(0, 10)} /></label>
         <label>Sync frequency<select name="frequency" defaultValue={store.orderSyncFrequency}>
@@ -421,6 +422,7 @@ function StoreSettings({ token, storeId, onBack, onNotice }: { token: string; st
       {saved && <p className="notice">{saved}</p>}
       <Details rows={[
         ["Last sync", store.orderSyncLastAt ? dateLabel(store.orderSyncLastAt) : "Never"],
+        ["Orders updated since", store.orderSyncCursor ? dateLabel(store.orderSyncCursor) : "No update cursor yet"],
         ["Next sync", store.orderSyncNextAt ? dateLabel(store.orderSyncNextAt) : store.orderSyncFrequency === "manual" ? "Manual only" : "Not scheduled"],
         ["Initial backfill", backfill],
         ["Orders synced", (store._count?.orders ?? 0).toLocaleString()],
@@ -1303,6 +1305,36 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
     setSelectedIds(selectedIds.size === rows.length ? new Set() : new Set(rows.map((order) => order.id)));
   }
 
+  async function copyOrderNumber(order: OrderRow) {
+    try {
+      await navigator.clipboard.writeText(order.darazOrderId);
+      setActionNotice(`Order number ${order.darazOrderId} copied.`);
+    } catch {
+      setActionNotice(`Order number: ${order.darazOrderId}`);
+    }
+  }
+
+  async function generateInvoice(order: OrderRow) {
+    if (!order.trackingNumber) {
+      setActionNotice("A tracking number is required before generating a tax invoice.");
+      return;
+    }
+    if (!confirm(`Generate & print the IMS tax invoice?\n\nOrder: ${order.darazOrderId}\nTracking: ${order.trackingNumber}\nCustomer: ${order.customerName ?? "—"}\nAmount: ${formatMoney(order.amount)}\n\nOnly one IMS invoice is allowed per tracking number.`)) return;
+    setBulkBusy(true);
+    setActionNotice("Generating IMS tax invoice…");
+    try {
+      const result = await api("/ims/invoices/generate", token, { method: "POST", body: JSON.stringify({ orderId: order.id, confirm: true }) });
+      const invoice = result.invoice;
+      setActionNotice(result.existing ? `Invoice ${invoice.imsInvoiceNumber ?? "already exists"} for this tracking number.` : `IMS invoice ${invoice.imsInvoiceNumber ?? "created"} · ${String(invoice.status).replaceAll("_", " ")}`);
+      if (invoice.pdfPath) await imsPdf(token, invoice.id, false).catch(() => {});
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "Invoice generation failed.");
+    } finally {
+      setBulkBusy(false);
+      setMoreMenu(null);
+    }
+  }
+
   return <>
     <section className="panel">
       <div className="section-head">
@@ -1377,7 +1409,10 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
                 return next;
               })} aria-label={`Select order ${order.darazOrderId}`} />
               <div className="order-customer"><strong>{order.customerName ?? "—"}</strong><span>{order.itemCount ?? 0} item(s) · {order.store.label}</span></div>
-              <div className="order-card-meta"><span>Order <b>{order.darazOrderId}</b></span><span>{dateLabel(order.orderCreatedAt)}</span></div>
+              <div className="order-card-meta">
+                <span>Order <b>{order.darazOrderId}</b> <button type="button" className="copy-icon" title="Copy order number" aria-label={`Copy order number ${order.darazOrderId}`} onClick={() => void copyOrderNumber(order)}>⧉</button></span>
+                <span>{dateLabel(order.orderCreatedAt)}</span>
+              </div>
             </div>
             <div className="order-card-body">
               <div><span>Amount</span><strong>{formatMoney(order.amount)}</strong></div>
@@ -1393,6 +1428,7 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
               <div className="more-wrap">
                 <button className="secondary" onClick={() => setMoreMenu(moreMenu === order.id ? null : order.id)}>More Actions ▾</button>
                 {moreMenu === order.id && <div className="more-menu">
+                  <button disabled={!order.trackingNumber || bulkBusy} onClick={() => void generateInvoice(order)}>Generate &amp; Print Invoice</button>
                   <button onClick={() => { setMoreMenu(null); void printOrders([order], "picklist"); }}>Print PickList</button>
                   <button onClick={() => { setMoreMenu(null); void printOrders([order], "invoice"); }}>Print Invoice</button>
                   <button onClick={() => sellerNote(order)}>Seller Note</button>

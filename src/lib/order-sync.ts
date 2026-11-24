@@ -1,4 +1,4 @@
-﻿import { randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type { OrderSyncFrequency, Prisma } from "@prisma/client";
 import { db } from "./db";
 import { fetchDarazOrderItems, fetchDarazOrders, safeDarazErrorMessage } from "./daraz";
@@ -317,6 +317,12 @@ export async function runDueOrderSyncs() {
 }
 
 export function startOrderSyncWorker() {
+  // Stores repaired outside the scheduler can end up with a null next run while still on a timed
+  // frequency. Re-arm them so scheduled incremental updates (update_after cursor) resume.
+  void db.store.updateMany({
+    where: { isActive: true, orderSyncFrequency: { not: "manual" }, orderSyncNextAt: null, tokens: { isNot: null } },
+    data: { orderSyncNextAt: new Date() },
+  }).catch((error: unknown) => console.error("Could not arm scheduled order syncs:", error instanceof Error ? error.message : error));
   const timer = setInterval(() => {
     void runDueOrderSyncs().catch((error: unknown) => {
       console.error("Order sync worker failed:", error instanceof Error ? error.message : "Unknown worker error.");

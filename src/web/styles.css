@@ -155,3 +155,6 @@
 .order-note{margin:8px 0 0;font-size:11px;color:#a8710e;background:#fff8eb;padding:6px 8px;border-radius:6px}
 .order-card-body .badge{justify-self:start;width:auto}
 .order-card-meta span{white-space:nowrap}
+.order-card-actions{justify-content:flex-end}
+.copy-icon{background:transparent;color:#9aa1a9;padding:0 2px;font-size:14px;line-height:1;transform:none}
+.copy-icon:hover{color:#ee5a24;background:transparent;transform:none}
