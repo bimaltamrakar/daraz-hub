@@ -238,7 +238,7 @@ export default function App() {
       <header className="topbar"><div className="topbar-left"><button type="button" className="nav-toggle" onClick={toggleNav} aria-label={navOpen ? "Hide navigation menu" : "Show navigation menu"} aria-expanded={navOpen} aria-controls="app-sidebar" title={navOpen ? "Hide navigation" : "Show navigation"}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 6h16M4 12h16M4 18h16" /></svg></button><div><p className="eyebrow">YOUR WORKSPACE</p><h1>{titleFor(route)}</h1></div></div><span className="secure"><span className="dot" /> Secure workspace</span></header>
       {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
       {user.mustChangePassword ? <section className="panel narrow"><h2>Set a new password</h2><p className="muted">The seeded administrator password must be changed before using this account.</p><form className="form-stack" onSubmit={changePassword}><label>Current password<input required name="currentPassword" type="password" /></label><label>New password<input required name="newPassword" type="password" minLength={12} /></label><button>Update password</button></form></section> :
-      page === "dashboard" ? <Dashboard token={token} onOpenStore={openStore} onManageStores={() => navigate({ page: "stores" })} /> : page === "stores" ? <>
+      page === "dashboard" ? <Dashboard token={token} onOpenStore={openStore} onManageStores={() => navigate({ page: "stores" })} onOpenOrders={() => navigate({ page: "orders" })} /> : page === "stores" ? <>
         <section className="panel add-panel"><div><h2>Add a store</h2><p className="muted">Start with a label and your Daraz marketplace region.</p></div><form className="add-form" onSubmit={addStore}><label>Store label<input required name="label" placeholder="e.g. Kathmandu Outlet" maxLength={100} /></label><label>Country / region<select required name="country" defaultValue=""><option value="" disabled>Select region</option><option value="NP">Nepal (NP)</option><option value="PK">Pakistan (PK)</option><option value="BD">Bangladesh (BD)</option><option value="LK">Sri Lanka (LK)</option><option value="MM">Myanmar (MM)</option></select></label><button disabled={busy}>Add store</button></form></section>
         <section className="panel"><div className="section-head"><div><h2>Your stores <span className="count">{stores.length}</span></h2><p className="muted">Click a store name for its seller details and connection history.</p></div><div className="head-actions"><button className={showInactiveStores ? "secondary live-on" : "secondary"} onClick={() => setShowInactiveStores((value) => !value)}>{showInactiveStores ? "Hide inactive" : "Show inactive"}</button></div></div>{stores.length ? <StoreList stores={stores} onOpen={openStore} onConnect={connect} onRefresh={refresh} onRemove={remove} onSettings={openStoreSettings} /> : <EmptyStores onClick={() => document.querySelector<HTMLInputElement>('input[name="label"]')?.focus()} />}</section>
       </> : page === "store" ? <StoreDetail key={route.storeId} token={token} storeId={route.storeId!} onBack={() => navigate({ page: "stores" })} onConnect={connect} onRefresh={refresh} onRemove={async (store) => { if (await remove(store)) navigate({ page: "stores" }); }} onSettings={() => navigate({ page: "store-settings", storeId: route.storeId! })} onNotice={setNotice} />
@@ -646,7 +646,7 @@ const shortNumber = (value: number) => {
 
 const formatCompact = (value: number) => Number.isFinite(value) ? `NPR ${shortNumber(value)}` : "—";
 
-const STORE_COLORS = ["#ee5a24", "#2f62b5", "#21835f", "#a8710e", "#6a4bc4", "#c94f44", "#1c7aa8", "#8b6c42", "#d1478a", "#3f7f6f"];
+const STORE_COLORS = ["#f0a500", "#0b6b5e", "#c25b2a", "#5b6770", "#8a6a2f", "#2f4f4f", "#a23b2a", "#6f7a76", "#b48a3c", "#465d63"];
 
 function SalesLineChart({ points, stores, hidden, showTotal }: {
   points: Array<{ date: string; total: number; byStore?: Record<string, number> }>;
@@ -818,7 +818,7 @@ function SalesHeatmap({ cells }: { cells: DashboardStats["heatmap"] }) {
   </div>;
 }
 
-function Dashboard({ token, onOpenStore, onManageStores }: { token: string; onOpenStore: (store: { id: string }) => void; onManageStores: () => void }) {
+function Dashboard({ token, onOpenStore, onManageStores, onOpenOrders }: { token: string; onOpenStore: (store: { id: string }) => void; onManageStores: () => void; onOpenOrders: () => void }) {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [days, setDays] = useState(14);
   const [storeId, setStoreId] = useState("");
@@ -944,12 +944,37 @@ function Dashboard({ token, onOpenStore, onManageStores }: { token: string; onOp
       <span className="dash-updated">{scopeLabel} · last {days} days · updated {updatedAt}{live ? " · refreshes every 30s" : ""}{syncNote && <span className="sync-note"> · {syncNote}</span>}</span>
     </div>
 
-    <div className="stat-grid">
-      <article className="stat-card"><div className="stat-head"><span>Net sales</span><span className="stat-icon icon-0">₨</span></div><strong>{formatCompact(totals.sales)}</strong><DeltaBadge value={comparison.salesPct} /><small>Paid orders · today {formatCompact(windows.today)}</small></article>
-      <article className="stat-card"><div className="stat-head"><span>Orders</span><span className="stat-icon icon-1">▣</span></div><strong>{totals.orders.toLocaleString()}</strong><DeltaBadge value={comparison.ordersPct} /><small>Unpaid {unpaid.toLocaleString()} · To Ship {toShip.toLocaleString()} · Shipping {shipping.toLocaleString()}</small></article>
-      <article className="stat-card"><div className="stat-head"><span>AOV</span><span className="stat-icon icon-2">≈</span></div><strong>{formatMoney(totals.aov)}</strong><DeltaBadge value={comparison.aovPct} /><small>{totals.unitsPerOrder} units/order · {totals.units.toLocaleString()} units</small></article>
-      <article className="stat-card"><div className="stat-head"><span>SKUs</span><span className="stat-icon icon-3">▦</span></div><strong>{(totals.products + totals.variants).toLocaleString()}</strong><small>{totals.products.toLocaleString()} products · {totals.variants.toLocaleString()} variants (current)</small></article>
-    </div>
+    <section className="dispatch-hero">
+      <div className="dispatch-copy">
+        <div className="dispatch-kicker"><span className="live-dot" /> Dispatch board · {scopeLabel} · last {days} days</div>
+        <h2>{toShip.toLocaleString()} orders<br />need <em>packing</em>.</h2>
+        <p>{unpaid.toLocaleString()} unpaid, {shipping.toLocaleString()} in transit. Today’s paid sales are {formatCompact(windows.today)}.</p>
+        <div className="dispatch-segments" aria-label="Order pipeline">
+          <i className="unpaid" style={{ width: `${Math.max(2, (unpaid / Math.max(1, unpaid + toShip + shipping)) * 100)}%` }} />
+          <i className="to-ship" style={{ width: `${Math.max(2, (toShip / Math.max(1, unpaid + toShip + shipping)) * 100)}%` }} />
+          <i className="shipping" style={{ width: `${Math.max(2, (shipping / Math.max(1, unpaid + toShip + shipping)) * 100)}%` }} />
+        </div>
+        <div className="dispatch-legend">
+          <span><i className="swatch-unpaid" /> Unpaid <b>{unpaid.toLocaleString()}</b></span>
+          <span><i className="swatch-toship" /> To Ship <b>{toShip.toLocaleString()}</b></span>
+          <span><i className="swatch-shipping" /> Shipping <b>{shipping.toLocaleString()}</b></span>
+        </div>
+        <button className="primary dispatch-cta" onClick={onOpenOrders}>Open order queue</button>
+      </div>
+      <aside className="dispatch-manifest">
+        <h3>Today’s manifest</h3>
+        <div className="manifest-big">{formatCompact(totals.sales)}</div>
+        <p>paid sales · last {days} days</p>
+        <div className="manifest-rows">
+          <div><span>Orders</span><b>{totals.orders.toLocaleString()}</b></div>
+          <div><span>To ship</span><b>{toShip.toLocaleString()}</b></div>
+          <div><span>AOV</span><b>{formatMoney(totals.aov)}</b></div>
+          <div><span>SKUs</span><b>{(totals.products + totals.variants).toLocaleString()}</b></div>
+          <div><span>Sync</span><b>{totals.connected}/{totals.stores} healthy</b></div>
+        </div>
+        <div className="manifest-stamp"><i /> All stores synced · {updatedAt}</div>
+      </aside>
+    </section>
 
     <section className="panel">
       <div className="section-head"><div><h2>Orders by status</h2><p className="muted">Daraz order statuses · {scopeLabel} · last {days} days</p></div></div>
