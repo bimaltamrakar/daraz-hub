@@ -5,6 +5,7 @@ type User = { id: string; name: string; email: string; role: "admin" | "user"; m
 type Store = {
   id: string; label: string; country: string; status: string; createdAt: string;
   storeType?: "normal" | "choice"; isActive?: boolean;
+  imsInvoicingEnabled?: boolean; imsPaymentMode?: string | null;
   sellerId: string | null; sellerName: string | null; companyName: string | null; sellerEmail: string | null; shortCode: string | null;
   account: string | null; accountPlatform: string | null; darazCountry: string | null; darazUserId: string | null;
   sellerStatus: string | null; verified: boolean | null; location: string | null; connectedAt: string | null;
@@ -143,11 +144,11 @@ export default function App() {
     if (token) void load();
   }, [showInactiveStores]);
 
-  async function submitAuth(event: FormEvent<HTMLFormElement>, mode: "login" | "signup") {
+  async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setNotice("");
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
-      const result = await api(`/auth/${mode}`, undefined, { method: "POST", body: JSON.stringify(data) });
+      const result = await api("/auth/login", undefined, { method: "POST", body: JSON.stringify(data) });
       setToken(result.accessToken); setUser(result.user);
       await load(result.accessToken);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to sign in."); }
@@ -196,16 +197,12 @@ export default function App() {
   if (!user) return <main className="auth-wrap">
     <section className="brand-card"><span className="brand-mark">D</span><p className="eyebrow">SELLER OPERATIONS</p><h1>One hub for every store.</h1><p>Connect your Daraz seller accounts and monitor token health from one secure workspace.</p></section>
     <section className="auth-card"><p className="eyebrow">DARAZ STORE HUB</p><h2>Welcome</h2><p className="muted">Sign in to manage your seller stores.</p>
-      <form onSubmit={(e) => submitAuth(e, "login")} className="form-stack">
+      <form onSubmit={submitAuth} className="form-stack">
         <label>Email<input required type="email" name="email" autoComplete="email" /></label>
         <label>Password<input required type="password" name="password" autoComplete="current-password" /></label>
         <button disabled={busy}>{busy ? "Please wait…" : "Sign in"}</button>
       </form>
-      <details className="signup"><summary>Create an account</summary><form onSubmit={(e) => submitAuth(e, "signup")} className="form-stack">
-        <label>Name<input required name="name" maxLength={100} /></label><label>Email<input required type="email" name="email" /></label>
-        <label>Password<input required type="password" name="password" minLength={12} /><small>12+ characters with uppercase, lowercase, number and symbol.</small></label>
-        <button disabled={busy}>Create account</button>
-      </form></details>
+      <p className="muted" style={{ marginTop: 14 }}>Accounts are provisioned by an administrator. There is no self sign-up.</p>
       {notice && <p className="notice error">{notice}</p>}
     </section>
   </main>;
@@ -378,6 +375,28 @@ function StoreSettings({ token, storeId, onBack, onNotice }: { token: string; st
     }
   }
 
+  async function saveImsInvoicing(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!store) return;
+    const form = new FormData(event.currentTarget);
+    const enabled = form.get("imsEnabled") === "on";
+    const paymentMode = String(form.get("imsPaymentMode") ?? "").trim();
+    if (enabled && !paymentMode) {
+      onNotice("Payment mode is required when IMS invoicing is enabled.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api(`/stores/${store.id}/ims`, token, { method: "PATCH", body: JSON.stringify({ enabled, paymentMode }) });
+      await reload();
+      onNotice(enabled ? "IMS tax invoicing enabled for this store." : "IMS tax invoicing disabled for this store.");
+    } catch (e) {
+      onNotice(e instanceof Error ? e.message : "Unable to update IMS invoicing.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const back = <button className="back-button" onClick={onBack}>← Store details</button>;
   if (error) return <section className="panel">{back}<p className="notice error">{error}</p></section>;
   if (!store) return <section className="panel">{back}<p className="muted">Loading settings…</p></section>;
@@ -443,6 +462,17 @@ function StoreSettings({ token, storeId, onBack, onNotice }: { token: string; st
         <button className="secondary" disabled={busy}>Save seller type</button>
       </form>
       {store.storeType === "choice" && <p className="notice">This store is orders-only. Create package, RTS and AWB actions are hidden for its orders; order details remain available for billing.</p>}
+    </section>
+
+    <section className="panel">
+      <h2>IMS tax invoicing</h2>
+      <p className="muted">Enable official IMS tax invoices for this store. The payment mode entered here is sent to IMS for every invoice from this store and overrides the global IMS default.</p>
+      <form className="sync-settings" onSubmit={saveImsInvoicing}>
+        <label className="checkbox-row"><input type="checkbox" name="imsEnabled" defaultChecked={store.imsInvoicingEnabled ?? false} /> Enable IMS tax invoicing</label>
+        <label>Payment mode<input name="imsPaymentMode" defaultValue={store.imsPaymentMode ?? ""} placeholder="e.g. cash" /></label>
+        <button className="secondary" disabled={busy}>Save IMS settings</button>
+      </form>
+      {!store.imsInvoicingEnabled && <p className="muted">Generate &amp; Print Tax Invoice stays hidden for this store until invoicing is enabled.</p>}
     </section>
 
     <section className="panel">
@@ -1100,7 +1130,7 @@ type OrderRow = {
   id: string; storeId: string; darazOrderId: string; customerName: string | null;
   orderCreatedAt: string; orderUpdatedAt: string | null; orderStatus: string | null; statusGroup: string | null;
   deliveryStatus: string | null; trackingNumber: string | null; amount: string | null; itemCount: number | null;
-  store: { label: string; country: string; storeType?: string };
+  store: { label: string; country: string; storeType?: string; imsInvoicingEnabled?: boolean; imsPaymentMode?: string | null };
 };
 type OrderSummary = { groups: Record<string, number>; toShip?: Record<string, number> };
 
@@ -1340,6 +1370,10 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
   }
 
   async function generateInvoice(order: OrderRow) {
+    if (!order.store.imsInvoicingEnabled) {
+      setActionNotice("IMS invoicing is disabled for this store. Enable it in store settings.");
+      return;
+    }
     if (!order.trackingNumber) {
       setActionNotice("A tracking number is required before generating a tax invoice.");
       return;
@@ -1453,7 +1487,7 @@ function Orders({ token, stores }: { token: string; stores: Store[] }) {
               <div className="more-wrap">
                 <button className="secondary" onClick={() => setMoreMenu(moreMenu === order.id ? null : order.id)}>More Actions ▾</button>
                 {moreMenu === order.id && <div className="more-menu">
-                  <button disabled={!order.trackingNumber || bulkBusy} onClick={() => void generateInvoice(order)}>Generate &amp; Print Invoice</button>
+                  <button onClick={() => { setMoreMenu(null); setSelected(order); }}>Tax invoices (by package)</button>
                   <button onClick={() => { setMoreMenu(null); void printOrders([order], "picklist"); }}>Print PickList</button>
                   <button onClick={() => { setMoreMenu(null); void printOrders([order], "invoice"); }}>Print Invoice</button>
                   <button onClick={() => sellerNote(order)}>Seller Note</button>
@@ -1483,12 +1517,19 @@ function OrderDrawer({ token, order, onClose }: { token: string; order: OrderRow
   const [actionBusy, setActionBusy] = useState<"" | "package" | "rts">("");
   const [actionNotice, setActionNotice] = useState("");
   const [actionError, setActionError] = useState("");
+  const [history, setHistory] = useState<any[]>([]);
 
   const load = useCallback(async (refresh = false) => {
     setLoading(true);
     setError("");
     try {
-      setDetail(await api(`/orders/${order.id}${refresh ? "?refresh=1" : ""}`, token));
+      const data = await api(`/orders/${order.id}${refresh ? "?refresh=1" : ""}`, token);
+      setDetail(data);
+      if (refresh) {
+        const count = Array.isArray(data.changes) ? data.changes.length : 0;
+        setActionNotice(count ? `Updated from Daraz: ${count} change(s) saved.` : "Latest order data saved. No changes.");
+      }
+      api(`/orders/${order.id}/changes`, token).then((result) => setHistory(result.changes ?? [])).catch(() => {});
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to load order details.");
     } finally {
@@ -1611,6 +1652,14 @@ function OrderDrawer({ token, order, onClose }: { token: string; order: OrderRow
           {actionNotice && <p className="notice">{actionNotice}</p>}
           {actionError && <p className="notice error">{actionError}</p>}
           {!isChoice && <OrderInvoice token={token} order={order} />}
+          {history.length > 0 && <details className="order-changes">
+            <summary>Change history ({history.length})</summary>
+            <div className="change-list">{history.map((change) => <div className="change-row" key={change.id}>
+              <span>{dateLabel(change.changedAt)} · {change.changedByName ?? "System"}</span>
+              <strong>{change.field}</strong>
+              <span>{change.oldValue ?? "—"} → {change.newValue ?? "—"}</span>
+            </div>)}</div>
+          </details>}
           {showRaw && <pre className="drawer-raw">{JSON.stringify(detail?.rawDetails ?? {}, null, 2)}</pre>}
         </>}
       </div>
@@ -1851,64 +1900,72 @@ async function imsPdf(token: string, invoiceId: string, download: boolean) {
 }
 
 function OrderInvoice({ token, order }: { token: string; order: OrderRow }) {
-  const [invoice, setInvoice] = useState<any>(null);
+  const [packages, setPackages] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const load = useCallback(async () => {
     try {
       const data = await api(`/ims/invoices/order/${order.id}`, token);
-      setInvoice(data.invoice);
+      setPackages(data.packages ?? []);
       setError("");
-    } catch (e) { setError(e instanceof Error ? e.message : "Unable to load invoice."); }
+    } catch (e) { setError(e instanceof Error ? e.message : "Unable to load package invoices."); }
     finally { setLoading(false); }
   }, [order.id, token]);
   useEffect(() => { void load(); }, [load]);
-  async function generate() {
-    if (!confirm(`Generate an IMS tax invoice?\n\nOrder: ${order.darazOrderId}\nTracking: ${order.trackingNumber ?? "—"}\nCustomer: ${order.customerName ?? "—"}\nAmount: ${formatMoney(order.amount)}\n\nThis creates the official IMS invoice and cannot be undone.`)) return;
-    setBusy(true); setError("");
+
+  async function generate(pkg: any) {
+    if (!pkg.trackingNumber) return;
+    if (!confirm(`Generate an IMS tax invoice for this package?\n\nOrder: ${order.darazOrderId}\nTracking: ${pkg.trackingNumber}\nPackage: ${pkg.packageId ?? "—"}\nAmount: ${formatMoney(pkg.amount)}\n\nOnly one invoice is allowed per tracking number.`)) return;
+    setBusy(pkg.trackingNumber); setError(""); setNotice("");
     try {
-      const result = await api("/ims/invoices/generate", token, { method: "POST", body: JSON.stringify({ orderId: order.id, confirm: true }) });
-      setInvoice(result.invoice);
+      const result = await api("/ims/invoices/generate", token, { method: "POST", body: JSON.stringify({ orderId: order.id, trackingNumber: pkg.trackingNumber, confirm: true }) });
+      setNotice(result.existing ? `Invoice already exists for ${pkg.trackingNumber}.` : `Invoice ${result.invoice?.imsInvoiceNumber ?? "created"} · ${String(result.invoice?.status).replaceAll("_", " ")}`);
+      await load();
       if (result.invoice?.pdfPath) await imsPdf(token, result.invoice.id, false).catch(() => {});
     } catch (e) { setError(e instanceof Error ? e.message : "Invoice generation failed."); await load(); }
-    finally { setBusy(false); }
+    finally { setBusy(null); }
   }
-  async function recover() {
-    if (!invoice) return;
-    setBusy(true);
-    try {
-      const result = await api(`/ims/invoices/${invoice.id}/recover-pdf`, token, { method: "POST" });
-      setInvoice(result.invoice);
-    } catch (e) { setError(e instanceof Error ? e.message : "PDF recovery failed."); }
-    finally { setBusy(false); }
+  async function recover(invoice: any) {
+    setBusy(invoice.id);
+    try { await api(`/ims/invoices/${invoice.id}/recover-pdf`, token, { method: "POST" }); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : "PDF recovery failed."); }
+    finally { setBusy(null); }
   }
-  if (loading) return <p className="muted">Loading tax invoice…</p>;
-  return <section className="order-invoice">
+
+  if (loading) return <p className="muted">Loading tax invoices…</p>;
+  if (order.store.imsInvoicingEnabled === false) return <section className="order-invoice">
     <h3>Tax Invoice</h3>
+    <p className="muted">IMS invoicing is disabled for this store. Enable it in the store’s IMS settings before generating a tax invoice.</p>
+  </section>;
+
+  return <section className="order-invoice">
+    <h3>Tax invoices by package</h3>
+    <p className="muted">Each package/tracking number gets its own IMS tax invoice. One tracking number can only have one invoice.</p>
     {error && <p className="notice error">{error}</p>}
-    {invoice ? <>
-      <div className="drawer-grid">
-        <div><span>IMS Invoice No.</span><strong>{invoice.imsInvoiceNumber ?? "Pending verification"}</strong></div>
-        <div><span>Invoice date</span><strong>{invoice.invoiceDate ? dateLabel(invoice.invoiceDate) : "—"}</strong></div>
-        <div><span>Generated</span><strong>{invoice.generatedAt ? dateLabel(invoice.generatedAt) : "—"}</strong></div>
-        <div><span>Generated by</span><strong>{invoice.generatedByName ?? "—"}</strong></div>
-        <div><span>Tracking</span><strong>{invoice.trackingNumber}</strong></div>
-        <div><span>Status</span><strong>{String(invoice.status).replaceAll("_", " ")}</strong></div>
-      </div>
-      {invoice.error && <p className="muted">{invoice.error}</p>}
-      <div className="drawer-actions">
-        {invoice.pdfPath && <>
-          <button className="secondary" onClick={() => void imsPdf(token, invoice.id, false)}>View Invoice</button>
-          <button className="secondary" onClick={() => void imsPdf(token, invoice.id, true)}>Download PDF</button>
-          <button className="secondary" onClick={() => void imsPdf(token, invoice.id, false)}>Print Tax Invoice</button>
-        </>}
-        {invoice.status === "pdf_recovery_required" && <button className="secondary" disabled={busy} onClick={() => void recover()}>{busy ? "Recovering…" : "Recover PDF"}</button>}
-      </div>
-    </> : <div className="drawer-actions">
-      <button className="primary" disabled={busy || !order.trackingNumber} onClick={() => void generate()}>{busy ? "Generating…" : "Generate & Print Tax Invoice"}</button>
-      {!order.trackingNumber && <span className="muted">Tracking number required.</span>}
-    </div>}
+    {notice && <p className="notice">{notice}</p>}
+    {packages.length === 0 && <p className="muted">No package tracking numbers are available for this order yet.</p>}
+    <div className="invoice-packages">{packages.map((pkg) => <article className="invoice-package" key={pkg.packageId ?? pkg.trackingNumber}>
+      <header><strong>{pkg.trackingNumber}</strong><span>{pkg.packageId ? `Package ${pkg.packageId}` : "Package"} · {pkg.itemCount} items · {formatMoney(pkg.amount)}</span></header>
+      {pkg.invoice ? <>
+        <div className="drawer-grid">
+          <div><span>IMS Invoice No.</span><strong>{pkg.invoice.imsInvoiceNumber ?? "Pending verification"}</strong></div>
+          <div><span>Invoice date</span><strong>{pkg.invoice.invoiceDate ? dateLabel(pkg.invoice.invoiceDate) : "—"}</strong></div>
+          <div><span>Generated</span><strong>{pkg.invoice.generatedAt ? dateLabel(pkg.invoice.generatedAt) : "—"}</strong></div>
+          <div><span>By</span><strong>{pkg.invoice.generatedByName ?? "—"}</strong></div>
+          <div><span>Status</span><strong>{String(pkg.invoice.status).replaceAll("_", " ")}</strong></div>
+        </div>
+        <div className="drawer-actions">
+          {pkg.invoice.pdfPath && <>
+            <button className="secondary" onClick={() => void imsPdf(token, pkg.invoice.id, false)}>View</button>
+            <button className="secondary" onClick={() => void imsPdf(token, pkg.invoice.id, true)}>Download</button>
+            <button className="secondary" onClick={() => void imsPdf(token, pkg.invoice.id, false)}>Print</button>
+          </>}
+          {pkg.invoice.status === "pdf_recovery_required" && <button className="secondary" disabled={busy === pkg.invoice.id} onClick={() => void recover(pkg.invoice)}>{busy === pkg.invoice.id ? "Recovering…" : "Recover PDF"}</button>}
+        </div>
+      </> : <button className="primary" disabled={busy === pkg.trackingNumber || !pkg.trackingNumber} onClick={() => void generate(pkg)}>{busy === pkg.trackingNumber ? "Generating…" : "Generate & Print Tax Invoice"}</button>}
+    </article>)}</div>
   </section>;
 }
 
@@ -1998,7 +2055,7 @@ function ImsSettings({ token }: { token: string }) {
       <label>Branch code<input required value={form.branchCode} onChange={(event) => setForm({ ...form, branchCode: event.target.value })} placeholder="MMX" /></label>
       <label>IMS user<input required value={form.imsUser} onChange={(event) => setForm({ ...form, imsUser: event.target.value })} /></label>
       <label>Warehouse<input required value={form.warehouse} onChange={(event) => setForm({ ...form, warehouse: event.target.value })} /></label>
-      <label>Payment mode<select value={form.paymentMode} onChange={(event) => setForm({ ...form, paymentMode: event.target.value })}><option value="cash">cash</option><option value="credit">credit</option><option value="creditcard">creditcard</option><option value="fonepay">fonepay</option></select></label>
+      <label>Payment mode<input required value={form.paymentMode} onChange={(event) => setForm({ ...form, paymentMode: event.target.value })} placeholder="e.g. cash" /></label>
       <label>Voucher type<select value={form.voucherType} onChange={(event) => setForm({ ...form, voucherType: event.target.value })}><option value="TI">Tax Invoice (TI)</option><option value="SI">Abbreviated Tax Invoice (SI)</option></select></label>
       <label>API key<input type="password" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} placeholder={saved?.hasApiKey ? "Saved — leave blank to keep" : "Required"} /></label>
       <div className="head-actions"><button disabled={busy}>Save settings</button><button type="button" className="secondary" disabled={busy} onClick={() => void test()}>Test API connection</button></div>

@@ -224,3 +224,15 @@ input:focus,select:focus{outline:2px solid var(--marigold);outline-offset:1px}
 @media(max-width:1100px){.dispatch-hero{grid-template-columns:1fr}.dispatch-manifest{order:-1}}
 .bar-fill{background:var(--marigold)}
 .line-chart path{stroke-linecap:round}
+.checkbox-row{display:flex!important;align-items:center;gap:8px;flex-direction:row!important}
+.checkbox-row input{width:16px;height:16px}
+.order-changes{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+.order-changes summary{cursor:pointer;font-weight:700;font-size:12px}
+.change-list{display:grid;gap:6px;margin-top:8px}
+.change-row{display:grid;grid-template-columns:1.2fr .7fr 1.5fr;gap:8px;font-size:10px;color:var(--mute);border-top:1px dashed var(--line);padding-top:5px}
+.change-row strong{color:var(--ink);font-size:10px}
+.invoice-packages{display:grid;gap:10px;margin-top:10px}
+.invoice-package{border:1px solid var(--line);padding:12px;border-radius:4px;background:#fff}
+.invoice-package header{display:flex;justify-content:space-between;gap:10px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:10px}
+.invoice-package header span{font-size:10px;color:var(--mute)}
+.invoice-package .primary{margin-top:4px}

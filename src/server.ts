@@ -177,18 +177,6 @@ const oauthStateCookieOptions = { httpOnly: true, secure: config.COOKIE_SECURE =
 const passwordSchema = z.string().min(12).max(128).regex(/[a-z]/).regex(/[A-Z]/).regex(/[0-9]/).regex(/[^A-Za-z0-9]/);
 const authRouter = express.Router();
 
-authRouter.post("/signup", rateLimit(5, 3600000), async (req, res) => {
-  const parsed = z.object({ name: z.string().trim().min(1).max(100), email: z.string().email().max(254), password: passwordSchema }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Provide a valid name, email and strong password." });
-  const email = parsed.data.email.toLowerCase();
-  if (await db.user.findUnique({ where: { email } })) return res.status(409).json({ error: "An account with this email already exists." });
-  const { password, ...profile } = parsed.data;
-  const user = await db.user.create({ data: { ...profile, email, passwordHash: await bcrypt.hash(password, 12) } });
-  await audit("signup", user.id);
-  await newSession(user.id, res);
-  return res.status(201).json({ accessToken: issueAccessToken({ id: user.id, role: user.role, mustChangePassword: false }), user: publicUser(user) });
-});
-
 authRouter.post("/login", rateLimit(8, 900000), async (req, res) => {
   const parsed = z.object({ email: z.string().email().max(254), password: z.string().min(1).max(128) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid email or password." });
@@ -286,7 +274,6 @@ app.get("/api/openapi.json", (_req, res) => res.json({
   openapi: "3.1.0", info: { title: "Daraz Store Hub API", version: "1.0.0" },
   servers: [{ url: "/api" }],
   paths: {
-    "/auth/signup": { post: { summary: "Register account" } },
     "/auth/login": { post: { summary: "Sign in" } },
     "/stores": { get: { summary: "List own stores" }, post: { summary: "Add store" } },
     "/stores/{id}": { get: { summary: "Store details and recent activity" }, delete: { summary: "Remove store" } },
@@ -385,6 +372,22 @@ api.patch("/stores/:id/active", async (req, res) => {
     include: { tokens: true },
   });
   await audit(parsed.data.isActive ? "store_activated" : "store_deactivated", req.auth!.id, store.id);
+  return res.json(publicStore(updated));
+});
+api.patch("/stores/:id/ims", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const parsed = z.object({ enabled: z.boolean(), paymentMode: z.string().trim().max(40).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Provide enabled and a payment mode." });
+  const store = await db.store.findFirst({ where: ownedStoreFilter(id, req.auth!.id) });
+  if (!store) return res.status(404).json({ error: "Store not found." });
+  const paymentMode = parsed.data.paymentMode?.trim() ?? "";
+  if (parsed.data.enabled && !paymentMode) return res.status(400).json({ error: "Payment mode is required when IMS invoicing is enabled." });
+  const updated = await db.store.update({
+    where: { id: store.id },
+    data: { imsInvoicingEnabled: parsed.data.enabled, imsPaymentMode: parsed.data.enabled ? paymentMode : null },
+    include: { tokens: true },
+  });
+  await audit("store_ims_invoicing_updated", req.auth!.id, store.id, { enabled: parsed.data.enabled, paymentMode: parsed.data.enabled ? paymentMode : null });
   return res.json(publicStore(updated));
 });
 api.patch("/stores/:id/type", async (req, res) => {
@@ -657,7 +660,7 @@ api.get("/orders", async (req, res) => {
       id: true, storeId: true, darazOrderId: true, customerName: true,
       orderCreatedAt: true, orderUpdatedAt: true, orderStatus: true, statusGroup: true,
       deliveryStatus: true, trackingNumber: true, amount: true, itemCount: true, syncedAt: true,
-      store: { select: { label: true, country: true, storeType: true } },
+      store: { select: { label: true, country: true, storeType: true, imsInvoicingEnabled: true, imsPaymentMode: true } },
     },
   });
   // Counting every store is expensive and unnecessary for the "All stores" queue; only
@@ -760,16 +763,52 @@ api.get("/orders/:id", rateLimit(30, 60000), async (req, res) => {
     const detailData = (detailBody as { data?: Record<string, unknown> }).data ?? {};
     const mergedRaw = { ...(detailBody as Record<string, unknown>), data: { ...detailData, order_items: items } };
     const normalized = normalizeOrder({ ...detail, order_items: items }, order.darazOrderId);
+    // Daraz's detail payload may omit fields that only exist on the list summary; keep the stored value
+    // rather than wiping a tracking number/status during a refresh.
+    if (!normalized.trackingNumber) normalized.trackingNumber = order.trackingNumber;
+    if (!normalized.orderStatus) normalized.orderStatus = order.orderStatus;
+    if (!normalized.statusGroup) normalized.statusGroup = order.statusGroup as typeof normalized.statusGroup;
+    if (!normalized.deliveryStatus) normalized.deliveryStatus = order.deliveryStatus;
+    if (normalized.amount == null) normalized.amount = order.amount?.toString() ?? null;
+    if (normalized.itemCount == null) normalized.itemCount = order.itemCount;
+    if (!normalized.customerName) normalized.customerName = order.customerName;
+    const changes: Array<{ field: string; oldValue: string | null; newValue: string | null }> = [];
+    const trackChange = (field: string, oldValue: unknown, newValue: unknown) => {
+      const before = oldValue === null || oldValue === undefined ? null : String(oldValue);
+      const after = newValue === null || newValue === undefined ? null : String(newValue);
+      if (before !== after) changes.push({ field, oldValue: before, newValue: after });
+    };
+    trackChange("orderStatus", order.orderStatus, normalized.orderStatus);
+    trackChange("statusGroup", order.statusGroup, normalized.statusGroup);
+    trackChange("deliveryStatus", order.deliveryStatus, normalized.deliveryStatus);
+    trackChange("trackingNumber", order.trackingNumber, normalized.trackingNumber);
+    trackChange("amount", order.amount?.toString(), normalized.amount);
+    trackChange("itemCount", order.itemCount, normalized.itemCount);
+    trackChange("customerName", order.customerName, normalized.customerName);
+    if (changes.length) {
+      const actor = await db.user.findUnique({ where: { id: req.auth!.id }, select: { name: true, email: true } });
+      const changedByName = actor?.name ?? actor?.email ?? null;
+      await db.orderChangeLog.createMany({
+        data: changes.map((change) => ({ ...change, orderId: order.id, storeId: order.storeId, source: "daraz_refresh", changedById: req.auth!.id, changedByName })),
+      });
+    }
     const updated = await db.storeOrder.update({
       where: { id: order.id },
       data: { ...normalized, rawDetails: mergedRaw as Prisma.InputJsonValue, itemsSyncedAt: new Date(), syncedAt: new Date() },
     });
     await upsertProductsFromOrderItems(order.storeId, items);
-    return res.json(updated);
+    return res.json({ ...updated, changes });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unable to load order details from Daraz.";
     return res.status(502).json({ error: safeDarazErrorMessage(store.country, message) });
   }
+});
+api.get("/orders/:id/changes", async (req, res) => {
+  const id = typeof req.params.id === "string" ? req.params.id : "";
+  const order = await db.storeOrder.findFirst({ where: { id, store: { userId: req.auth!.id, isActive: true } }, select: { id: true } });
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  const changes = await db.orderChangeLog.findMany({ where: { orderId: id }, orderBy: { changedAt: "desc" }, take: 50 });
+  return res.json({ changes });
 });
 api.get("/orders/:id/awb", rateLimit(20, 60000), async (req, res) => {
   const id = typeof req.params.id === "string" ? req.params.id : "";
@@ -1090,31 +1129,71 @@ api.get("/ims/invoices", async (req, res) => {
   return res.json({ invoices, total, summary: { total, today, pending, failed } });
 });
 
+function orderPackages(order: any) {
+  const data = order.rawDetails?.data ?? {};
+  const items: any[] = Array.isArray(data.order_items) ? data.order_items : [];
+  const groups = new Map<string, { packageId: string | null; trackingNumber: string; items: any[]; amount: number; itemCount: number }>();
+  for (const item of items) {
+    const tracking = normalizeTracking(item.tracking_code ?? item.tracking_number ?? "");
+    const packageId = item.package_id ? String(item.package_id) : null;
+    const key = packageId ?? tracking ?? "unassigned";
+    if (!key) continue;
+    const group = groups.get(key) ?? { packageId, trackingNumber: tracking, items: [], amount: 0, itemCount: 0 };
+    group.items.push(item);
+    group.itemCount += Number(item.quantity ?? 1) || 1;
+    group.amount += Number(item.paid_price ?? item.unit_price ?? 0) * (Number(item.quantity ?? 1) || 1);
+    if (!group.trackingNumber && tracking) group.trackingNumber = tracking;
+    groups.set(key, group);
+  }
+  const result = [...groups.values()].filter((group) => group.trackingNumber);
+  if (result.length) return result;
+  const tracked = normalizeTracking(order.trackingNumber).split(/[,\s]+/).filter(Boolean);
+  if (tracked.length) {
+    return tracked.map((trackingNumber) => ({
+      packageId: null,
+      trackingNumber,
+      items: tracked.length === 1 ? items : [],
+      amount: tracked.length === 1 ? Number(order.amount ?? 0) : 0,
+      itemCount: tracked.length === 1 ? Number(order.itemCount ?? items.length) : 0,
+    }));
+  }
+  return [];
+}
+
 api.get("/ims/invoices/order/:orderId", async (req, res) => {
   const orderId = typeof req.params.orderId === "string" ? req.params.orderId : "";
-  const order = await db.storeOrder.findFirst({ where: { id: orderId, store: { userId: req.auth!.id, isActive: true } }, include: { imsInvoiceOrders: { include: { invoice: true } } } });
+  const order = await db.storeOrder.findFirst({ where: { id: orderId, store: { userId: req.auth!.id, isActive: true } } });
   if (!order) return res.status(404).json({ error: "Order not found." });
-  const invoice = order.imsInvoiceOrders[0]?.invoice;
-  if (!invoice) return res.json({ invoice: null, trackingNumber: order.trackingNumber });
-  return res.json({ invoice, trackingNumber: order.trackingNumber });
+  const packages = orderPackages(order);
+  const invoices = await db.imsInvoice.findMany({ where: { trackingNormalized: { in: packages.map((pkg) => normalizeTracking(pkg.trackingNumber)) } } });
+  return res.json({
+    packages: packages.map((pkg) => ({
+      packageId: pkg.packageId,
+      trackingNumber: pkg.trackingNumber,
+      itemCount: pkg.itemCount,
+      amount: pkg.amount,
+      invoice: invoices.find((invoice) => invoice.trackingNormalized === normalizeTracking(pkg.trackingNumber)) ?? null,
+    })),
+  });
 });
 
 api.post("/ims/invoices/generate", async (req, res) => {
-  const parsed = z.object({ orderId: z.string().min(1), confirm: z.literal(true) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Explicit confirmation is required to generate a tax invoice." });
+  const parsed = z.object({ orderId: z.string().min(1), trackingNumber: z.string().min(1), confirm: z.literal(true) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Explicit confirmation and a package tracking number are required." });
   const order = await db.storeOrder.findFirst({
     where: { id: parsed.data.orderId, store: { userId: req.auth!.id, isActive: true } },
-    include: { store: { include: { tokens: true } }, imsInvoiceOrders: { include: { invoice: true } } },
+    include: { store: { include: { tokens: true } } },
   });
   if (!order) return res.status(404).json({ error: "Order not found." });
   if (order.store.storeType === "choice") return res.status(409).json({ error: "Choice seller orders cannot be invoiced here." });
-  const tracking = normalizeTracking(order.trackingNumber);
-  if (!tracking) return res.status(409).json({ error: "This order has no Daraz tracking number yet." });
-  const existingOrderInvoice = order.imsInvoiceOrders[0]?.invoice;
-  if (existingOrderInvoice) return res.json({ invoice: existingOrderInvoice, existing: true });
+  if (!order.store.imsInvoicingEnabled) return res.status(409).json({ error: "IMS invoicing is disabled for this store." });
+  const packages = orderPackages(order);
+  const selected = packages.find((pkg) => normalizeTracking(pkg.trackingNumber) === normalizeTracking(parsed.data.trackingNumber));
+  if (!selected) return res.status(409).json({ error: "That tracking number is not a package on this order." });
+  const tracking = normalizeTracking(selected.trackingNumber);
   const existing = await db.imsInvoice.findUnique({ where: { trackingNormalized: tracking } });
   if (existing) {
-    await db.imsInvoiceOrder.upsert({ where: { orderId: order.id }, create: { invoiceId: existing.id, orderId: order.id }, update: { invoiceId: existing.id } });
+    await db.imsInvoiceOrder.createMany({ data: [{ invoiceId: existing.id, orderId: order.id }], skipDuplicates: true });
     return res.json({ invoice: existing, existing: true });
   }
 
@@ -1122,13 +1201,14 @@ api.post("/ims/invoices/generate", async (req, res) => {
   try { ims = await getImsConfig(); } catch (error) {
     return res.status(409).json({ error: error instanceof Error ? error.message : "IMS is not configured." });
   }
+  const storePaymentMode = order.store.imsPaymentMode || ims.paymentMode;
 
   let invoice;
   try {
     const actor = await db.user.findUnique({ where: { id: req.auth!.id }, select: { name: true, email: true } });
     invoice = await db.imsInvoice.create({
       data: {
-        trackingNumber: order.trackingNumber ?? tracking,
+        trackingNumber: selected.trackingNumber,
         trackingNormalized: tracking,
         status: "generating",
         generatedById: req.auth!.id,
@@ -1144,14 +1224,15 @@ api.post("/ims/invoices/generate", async (req, res) => {
   }
 
   try {
-    let items = buildOrderItems(order, order.rawDetails);
+    let items = buildOrderItems(order, { data: { order_items: selected.items } });
     if (!items.length) {
       const accessToken = await fetchAccessToken(order.store);
       const body = await fetchDarazOrderItems(order.store.country, accessToken, order.darazOrderId);
       const fetched = Array.isArray((body as any)?.data) ? (body as any).data : [];
-      items = buildOrderItems(order, { data: { order_items: fetched } });
+      items = buildOrderItems(order, { data: { order_items: fetched.filter((item: any) => normalizeTracking(item.tracking_code ?? item.tracking_number ?? "") === tracking) } });
     }
-    if (!items.length) throw new ImsError("No invoice line items are available for this order.", "items_missing");
+    if (!items.length) throw new ImsError("No invoice line items are available for this package.", "items_missing");
+    const invoiceAmount = selected.amount || Number(order.amount ?? 0);
     const raw = (order.rawDetails as any)?.data ?? order.rawDetails ?? {};
     const address = raw.address_shipping ?? {};
 
@@ -1170,9 +1251,10 @@ api.post("/ims/invoices/generate", async (req, res) => {
         address: [address.address1, address.address2, address.address3, address.city].filter(Boolean).join(", "),
         mobile: address.phone ?? "",
         pan: raw.vat_no ?? "",
-        amount: Number(order.amount ?? 0),
+        amount: invoiceAmount,
         items,
         remarks: `Daraz Hub order ${order.darazOrderId}`,
+        paymentMode: storePaymentMode,
       });
       responseBody = result.body;
       imsNumber = invoiceNumberFromResponse(result.body);
@@ -1188,7 +1270,7 @@ api.post("/ims/invoices/generate", async (req, res) => {
       where: { id: invoice.id },
       data: { imsInvoiceNumber: imsNumber, invoiceDate, generatedAt: new Date(), status: "invoice_created", imsResponse: responseBody ? JSON.parse(JSON.stringify(responseBody)) : undefined, error: null },
     });
-    await db.imsInvoiceOrder.upsert({ where: { orderId: order.id }, create: { invoiceId: invoice.id, orderId: order.id }, update: { invoiceId: invoice.id } });
+    await db.imsInvoiceOrder.createMany({ data: [{ invoiceId: invoice.id, orderId: order.id }], skipDuplicates: true });
 
     let withPdf;
     try { withPdf = await attachInvoicePdf(invoice.id, ims); }
@@ -1205,7 +1287,7 @@ api.post("/ims/invoices/generate", async (req, res) => {
         const found = await lookupImsBill(ims, tracking);
         if (found) {
           const updated = await db.imsInvoice.update({ where: { id: invoice.id }, data: { imsInvoiceNumber: found.vchrno, generatedAt: new Date(), status: "invoice_created", imsResponse: JSON.parse(JSON.stringify(found.raw ?? {})) } });
-          await db.imsInvoiceOrder.upsert({ where: { orderId: order.id }, create: { invoiceId: updated.id, orderId: order.id }, update: { invoiceId: updated.id } });
+          await db.imsInvoiceOrder.createMany({ data: [{ invoiceId: updated.id, orderId: order.id }], skipDuplicates: true });
           const withPdf = await attachInvoicePdf(updated.id, ims).catch(async () => db.imsInvoice.update({ where: { id: updated.id }, data: { status: "pdf_recovery_required", error: "IMS invoice exists but PDF retrieval failed." } }));
           return res.status(201).json({ invoice: withPdf });
         }

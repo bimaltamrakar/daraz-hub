@@ -140,6 +140,7 @@ export async function createImsBill(config: ImsConfig, input: {
   amount: number;
   items: ImsOrderItem[];
   remarks: string;
+  paymentMode?: string;
 }) {
   const now = new Date();
   const dateParts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kathmandu", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
@@ -150,7 +151,7 @@ export async function createImsBill(config: ImsConfig, input: {
     branchCode: config.branchCode,
     user: config.imsUser,
     tender: input.amount,
-    paymentMode: config.paymentMode,
+    paymentMode: input.paymentMode || config.paymentMode,
     partyName: input.customerName,
     address: input.address,
     vatNo: input.pan,

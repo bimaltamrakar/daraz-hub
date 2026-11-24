@@ -69,6 +69,9 @@ model Store {
   isActive           Boolean            @default(true)
   // Normal sellers print their own AWBs; Choice sellers are fulfilled by Daraz.
   storeType          StoreType          @default(normal)
+  // Per-store IMS tax invoicing: disabled unless explicitly enabled; payment mode overrides the global IMS default.
+  imsInvoicingEnabled Boolean           @default(false)
+  imsPaymentMode     String?
   sellerId           String?
   status             StoreStatus        @default(pending)
   // Seller identity captured from the Daraz token response at authorization time.
@@ -169,7 +172,6 @@ model ImsInvoiceOrder {
   invoice   ImsInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   order     StoreOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
   @@id([invoiceId, orderId])
-  @@unique([orderId])
 }
 
 model StoreOrder {
@@ -191,6 +193,7 @@ model StoreOrder {
   itemsSyncedAt  DateTime?
   syncedAt       DateTime  @default(now())
   imsInvoiceOrders ImsInvoiceOrder[]
+  changeLogs     OrderChangeLog[]
   store          Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
 
   @@unique([storeId, darazOrderId])
@@ -199,6 +202,22 @@ model StoreOrder {
   @@index([storeId, statusGroup])
   @@index([orderStatus])
   @@index([deliveryStatus])
+}
+
+model OrderChangeLog {
+  id        String   @id @default(cuid())
+  orderId   String
+  storeId   String
+  field     String
+  oldValue  String?
+  newValue  String?
+  changedById String?
+  changedByName String?
+  source    String   @default("daraz_refresh")
+  changedAt DateTime @default(now())
+  order     StoreOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  @@index([orderId, changedAt])
+  @@index([storeId, changedAt])
 }
 
 model ProductMaster {
